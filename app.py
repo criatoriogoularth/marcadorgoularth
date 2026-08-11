@@ -259,11 +259,11 @@ def api_classificar(codigo):
         sala['quantidade_classificados'] = qtd
 
         elim = sala['provas']['eliminatorias']
-        ranking = sorted(elim['itens'].values(), key=lambda x: x['tempo_segundos'], reverse=True)
-        classificados = ranking[:qtd]
+        ranking = sorted(elim['itens'].items(), key=lambda kv: kv[1]['tempo_segundos'], reverse=True)
+        classificados = ranking[:qtd]   # lista de (elim_id, item)
 
         final = sala['provas']['final']
-        for item in classificados:
+        for elim_id, item in classificados:
             item_id = str(sala['proximo_id'])
             sala['proximo_id'] += 1
             final['itens'][item_id] = {
@@ -273,6 +273,7 @@ def api_classificar(codigo):
                 "esp32_id": None,
                 "tempo_texto": "00:00:000",
                 "tempo_segundos": 0.0,
+                "origem_id": elim_id,   # liga de volta ao tempo da eliminatória
             }
     return jsonify({"ok": True, "classificados": len(classificados)})
 
@@ -380,25 +381,42 @@ def api_tick(codigo):
 
 @app.route('/api/sala/<codigo>/ranking_geral')
 def api_ranking_geral(codigo):
+    """Resultado Geral = uma linha por pássaro que chegou na Final, mostrando
+    o tempo de cada fase, mas a COLOCAÇÃO é sempre pelo tempo da Final —
+    a Eliminatória é só classificatória, não compete com a Final (mesma
+    lógica do programa original)."""
     sala = obter_sala(codigo)
     if not sala:
         return jsonify({"ok": False}), 404
     with sala['lock']:
-        todos = []
-        for tipo in ('eliminatorias', 'final'):
-            for item in sala['provas'][tipo]['itens'].values():
-                todos.append({
-                    "nome": item['nome'],
-                    "anilha": item.get('anilha', ''),
-                    "proprietario": item.get('proprietario', ''),
-                    "tipo": tipo,
-                    "tempo_texto": item['tempo_texto'],
-                    "tempo_segundos": item['tempo_segundos'],
-                })
-        todos.sort(key=lambda x: x['tempo_segundos'], reverse=True)
-        for i, r in enumerate(todos, 1):
+        elim_itens = sala['provas']['eliminatorias']['itens']
+        final_itens = sala['provas']['final']['itens']
+
+        # mapa auxiliar (nome, anilha) -> item da eliminatória, pra achar o
+        # tempo de eliminatória de pássaros que foram parar na final sem
+        # passar pelo botão "Classificar" (adicionados direto na Final)
+        por_nome_anilha = {(it['nome'], it.get('anilha', '')): it for it in elim_itens.values()}
+
+        linhas = []
+        for fitem in final_itens.values():
+            origem_id = fitem.get('origem_id')
+            elim_item = elim_itens.get(origem_id) if origem_id else None
+            if elim_item is None:
+                elim_item = por_nome_anilha.get((fitem['nome'], fitem.get('anilha', '')))
+
+            linhas.append({
+                "nome": fitem['nome'],
+                "anilha": fitem.get('anilha', ''),
+                "proprietario": fitem.get('proprietario', ''),
+                "tempo_eliminatoria_texto": elim_item['tempo_texto'] if elim_item else '-',
+                "tempo_final_texto": fitem['tempo_texto'],
+                "tempo_final_segundos": fitem['tempo_segundos'],
+            })
+
+        linhas.sort(key=lambda x: x['tempo_final_segundos'], reverse=True)
+        for i, r in enumerate(linhas, 1):
             r['posicao'] = i
-    return jsonify({"ok": True, "ranking": todos})
+    return jsonify({"ok": True, "ranking": linhas})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -624,9 +642,9 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
   <!-- ═══════ RESULTADO GERAL ═══════ -->
   <div id="telaGeral" class="card" style="display:none">
     <h2 style="margin-top:0">🏆 Resultado Geral</h2>
-    <div class="sub">Eliminatória + Final combinados, do maior tempo de canto pro menor. Salvo automaticamente neste navegador.</div>
+    <div class="sub">Colocação pelo tempo da Final (a Eliminatória é só classificatória). Salvo automaticamente neste navegador.</div>
     <table id="tabelaGeral">
-      <thead><tr><th>#</th><th>Pássaro</th><th>Anilha</th><th>Proprietário</th><th>Fase</th><th>Tempo</th></tr></thead>
+      <thead><tr><th>#</th><th>Pássaro</th><th>Anilha</th><th>Proprietário</th><th>Eliminatória</th><th>Final</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -652,23 +670,14 @@ function salvarCadastro(lista) {
 }
 
 // ═══════ ARQUIVO LOCAL DE RESULTADOS (sobrevive a reinício do servidor) ═══════
+// Guarda direto a lista já pronta que vem do /ranking_geral (uma linha por
+// pássaro da Final, com o tempo da Eliminatória e o tempo da Final juntos).
 function carregarResultadosLocais() {
-  try { return JSON.parse(localStorage.getItem(CHAVE_RESULTADOS)) || {}; }
-  catch (e) { return {}; }
+  try { return JSON.parse(localStorage.getItem(CHAVE_RESULTADOS)) || []; }
+  catch (e) { return []; }
 }
-function salvarResultadosLocais(obj) {
-  localStorage.setItem(CHAVE_RESULTADOS, JSON.stringify(obj));
-}
-function mesclarResultadosLocais(tipo, itens) {
-  const armazenado = carregarResultadosLocais();
-  itens.forEach(item => {
-    const chave = tipo + ':' + item.id;
-    armazenado[chave] = {
-      nome: item.nome, anilha: item.anilha || '', proprietario: item.proprietario || '',
-      tipo: tipo, tempo_texto: item.tempo_texto, tempo_segundos: item.tempo_segundos,
-    };
-  });
-  salvarResultadosLocais(armazenado);
+function salvarResultadosLocais(lista) {
+  localStorage.setItem(CHAVE_RESULTADOS, JSON.stringify(lista));
 }
 
 function marcarOffline(offline) {
@@ -834,7 +843,6 @@ async function atualizarProva() {
         tbody.appendChild(tr);
       });
     }
-    mesclarResultadosLocais(tipoProvaAtual, data.itens);
   } catch (e) {
     marcarOffline(true);
   }
@@ -878,22 +886,22 @@ async function classificarParaFinal() {
   }
 }
 
-// ═══════ RESULTADO GERAL (lê do arquivo local — sobrevive a reinício do servidor) ═══════
+// ═══════ RESULTADO GERAL (lê do arquivo local — sobrevive a reinício do
+// servidor). Uma linha por pássaro da Final; a colocação é sempre pelo
+// tempo da Final — a Eliminatória só aparece como referência ao lado. ═══════
 function renderGeral() {
-  const armazenado = carregarResultadosLocais();
-  const lista = Object.values(armazenado);
-  lista.sort((a, b) => b.tempo_segundos - a.tempo_segundos);
+  const lista = carregarResultadosLocais();
   const tbody = document.querySelector('#tabelaGeral tbody');
   if (lista.length === 0) {
-    tbody.innerHTML = '<tr><td class="vazio" colspan="6">ainda sem resultados</td></tr>';
+    tbody.innerHTML = '<tr><td class="vazio" colspan="6">ainda sem pássaros na Final</td></tr>';
     return;
   }
   tbody.innerHTML = '';
-  lista.forEach((r, i) => {
+  lista.forEach(r => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${i + 1}º</td><td>${r.nome}</td><td>${r.anilha || ''}</td><td>${r.proprietario || ''}</td>
-      <td>${r.tipo === 'eliminatorias' ? 'Eliminatória' : 'Final'}</td>
-      <td style="font-family:monospace">${r.tempo_texto}</td>`;
+    tr.innerHTML = `<td>${r.posicao}º</td><td>${r.nome}</td><td>${r.anilha || ''}</td><td>${r.proprietario || ''}</td>
+      <td style="font-family:monospace">${r.tempo_eliminatoria_texto}</td>
+      <td style="font-family:monospace">${r.tempo_final_texto}</td>`;
     tbody.appendChild(tr);
   });
 }
@@ -901,13 +909,11 @@ function renderGeral() {
 // ═══════ SINCRONIZAÇÃO DE FUNDO (mantém o arquivo local sempre atualizado,
 // mesmo que o organizador esteja numa aba diferente) ═══════
 async function sincronizarFundo() {
-  for (const tipo of ['eliminatorias', 'final']) {
-    try {
-      const resp = await fetch(`/api/sala/${codigo}/prova/${tipo}`);
-      const data = await resp.json();
-      if (data.ok) mesclarResultadosLocais(tipo, data.itens);
-    } catch (e) { /* servidor fora do ar — os dados que já tem continuam salvos */ }
-  }
+  try {
+    const resp = await fetch(`/api/sala/${codigo}/ranking_geral`);
+    const data = await resp.json();
+    if (data.ok) salvarResultadosLocais(data.ranking);
+  } catch (e) { /* servidor fora do ar — o que já tem continua salvo */ }
   if (telaAtual === 'geral') renderGeral();
 }
 
