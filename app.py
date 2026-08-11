@@ -150,6 +150,8 @@ def api_cadastrar_prova(codigo):
             sala['proximo_id'] += 1
             prova['itens'][item_id] = {
                 "nome": nome,
+                "anilha": str(p.get('anilha', '')).strip()[:20],
+                "proprietario": str(p.get('proprietario', '')).strip()[:40],
                 "esp32_id": None,
                 "tempo_texto": "00:00:000",
                 "tempo_segundos": 0.0,
@@ -172,6 +174,8 @@ def api_ver_prova(codigo, tipo):
             {
                 "id": iid,
                 "nome": item["nome"],
+                "anilha": item.get("anilha", ""),
+                "proprietario": item.get("proprietario", ""),
                 "vinculado": item["esp32_id"] is not None,
                 "tempo_texto": item["tempo_texto"],
                 "tempo_segundos": item["tempo_segundos"],
@@ -215,12 +219,7 @@ def api_finalizar_prova(codigo, tipo):
     if not sala or tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
     with sala['lock']:
-        prova = sala['provas'][tipo]
-        prova['ativa'] = False
-        prova['finalizada'] = True
-        for item in prova['itens'].values():
-            if item['esp32_id']:
-                empurrar_comando(sala, item['esp32_id'], "FINALIZAR")
+        _finalizar_prova_interno(sala, tipo)
     return jsonify({"ok": True})
 
 
@@ -269,6 +268,8 @@ def api_classificar(codigo):
             sala['proximo_id'] += 1
             final['itens'][item_id] = {
                 "nome": item['nome'],
+                "anilha": item.get('anilha', ''),
+                "proprietario": item.get('proprietario', ''),
                 "esp32_id": None,
                 "tempo_texto": "00:00:000",
                 "tempo_segundos": 0.0,
@@ -388,6 +389,8 @@ def api_ranking_geral(codigo):
             for item in sala['provas'][tipo]['itens'].values():
                 todos.append({
                     "nome": item['nome'],
+                    "anilha": item.get('anilha', ''),
+                    "proprietario": item.get('proprietario', ''),
                     "tipo": tipo,
                     "tempo_texto": item['tempo_texto'],
                     "tempo_segundos": item['tempo_segundos'],
@@ -402,14 +405,34 @@ def api_ranking_geral(codigo):
 # LIMPEZA DE SALAS VELHAS (evita crescer memória pra sempre)
 # ════════════════════════════════════════════════════════════════════
 
+def _finalizar_prova_interno(sala, tipo):
+    """Mesma lógica do endpoint /finalizar, reaproveitada tanto pelo
+    organizador clicando quanto pelo relógio automático."""
+    prova = sala['provas'][tipo]
+    prova['ativa'] = False
+    prova['finalizada'] = True
+    for item in prova['itens'].values():
+        if item['esp32_id']:
+            empurrar_comando(sala, item['esp32_id'], "FINALIZAR")
+
+
 def _reaper():
     while True:
-        time.sleep(60)
+        time.sleep(1)
         agora = time.time()
         with salas_lock:
-            expiradas = [c for c, s in salas.items() if agora - s['ultimo_uso'] > 12 * 3600]
-            for c in expiradas:
-                del salas[c]
+            itens_salas = list(salas.items())
+        for codigo, sala in itens_salas:
+            with sala['lock']:
+                for tipo in ('eliminatorias', 'final'):
+                    prova = sala['provas'][tipo]
+                    if prova['ativa'] and tempo_restante(prova) <= 0:
+                        _finalizar_prova_interno(sala, tipo)
+        if int(agora) % 60 == 0:
+            with salas_lock:
+                expiradas = [c for c, s in salas.items() if agora - s['ultimo_uso'] > 12 * 3600]
+                for c in expiradas:
+                    del salas[c]
 
 
 threading.Thread(target=_reaper, daemon=True).start()
@@ -523,6 +546,13 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <title>Marcador Digital - Organizador</title>
 <style>""" + ESTILO_BASE + """
 .faixa-codigo { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+.relogio { text-align:center; margin:6px 0 16px; }
+.relogio-numero { font-family:monospace; font-size:52px; color:#F0C030; font-weight:bold; letter-spacing:2px; }
+.relogio-legenda { color:#93a4c3; font-size:12px; }
+.relogio.acabando .relogio-numero { color:#B0271A; }
+.aviso-offline { background:#4a1414; border:1px solid #B0271A; color:#ffd0cc; padding:10px 12px;
+                  border-radius:8px; font-size:12px; margin-bottom:12px; display:none; }
+.aviso-offline.mostrar { display:block; }
 </style>
 </head>
 <body>
@@ -533,6 +563,11 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
       <div class="sub">sala <span class="codigo-sala" id="codigoTopo">------</span></div>
     </div>
     <button class="btn-roxo" onclick="copiarLinkCelular()">📟 Link do celular</button>
+  </div>
+
+  <div class="aviso-offline" id="avisoOffline">
+    ⚠ Sem conexão com o servidor da sala agora (pode ter reiniciado). Os
+    resultados que já chegaram continuam salvos aqui neste navegador.
   </div>
 
   <div class="tabs">
@@ -547,8 +582,13 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
     <h2 style="margin-top:0">Cadastro de pássaros</h2>
     <div class="sub">Fica salvo neste navegador (nesta sala).</div>
     <input type="text" id="nomeNovoPassaro" placeholder="Nome do pássaro">
+    <input type="text" id="anilhaNovoPassaro" placeholder="Anilha">
+    <input type="text" id="proprietarioNovoPassaro" placeholder="Proprietário">
     <button class="btn-azul" onclick="adicionarPassaroCadastro()" style="width:100%">➕ Adicionar ao cadastro</button>
-    <table id="tabelaCadastro"><tbody></tbody></table>
+    <table id="tabelaCadastro">
+      <thead><tr><th>Pássaro</th><th>Anilha</th><th>Proprietário</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
     <div class="linha-botoes">
       <button class="btn-ouro" onclick="adicionarTodosAProva()" style="flex:1">
         ➡️ Adicionar TODOS à prova (<span id="destinoCadastro">Eliminatória</span>)
@@ -559,9 +599,15 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
   <!-- ═══════ ELIMINATÓRIA / FINAL (mesma estrutura, tipo trocado por JS) ═══════ -->
   <div id="telaProva" class="card" style="display:none">
     <h2 style="margin-top:0" id="tituloProva">Eliminatória</h2>
+
+    <div class="relogio" id="blocoRelogio" style="display:none">
+      <div class="relogio-numero" id="relogioNumero">00:00</div>
+      <div class="relogio-legenda" id="relogioLegenda">tempo restante da prova</div>
+    </div>
+
     <div class="sub" id="statusProva">carregando...</div>
     <table id="tabelaProva">
-      <thead><tr><th>Pássaro</th><th>Vinculado</th><th>Tempo</th></tr></thead>
+      <thead><tr><th>Pássaro</th><th>Anilha</th><th>Proprietário</th><th>Vinculado</th><th>Tempo</th></tr></thead>
       <tbody></tbody>
     </table>
     <div class="linha-botoes">
@@ -578,14 +624,11 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
   <!-- ═══════ RESULTADO GERAL ═══════ -->
   <div id="telaGeral" class="card" style="display:none">
     <h2 style="margin-top:0">🏆 Resultado Geral</h2>
-    <div class="sub">Eliminatória + Final combinados, do maior tempo de canto pro menor.</div>
+    <div class="sub">Eliminatória + Final combinados, do maior tempo de canto pro menor. Salvo automaticamente neste navegador.</div>
     <table id="tabelaGeral">
-      <thead><tr><th>#</th><th>Pássaro</th><th>Fase</th><th>Tempo</th></tr></thead>
+      <thead><tr><th>#</th><th>Pássaro</th><th>Anilha</th><th>Proprietário</th><th>Fase</th><th>Tempo</th></tr></thead>
       <tbody></tbody>
     </table>
-    <div class="linha-botoes">
-      <button class="btn-ouro" onclick="salvarResultadoNoNavegador()">💾 Salvar resultado no navegador</button>
-    </div>
   </div>
 </div>
 
@@ -594,10 +637,11 @@ const codigo = location.pathname.split('/').pop().toUpperCase();
 document.getElementById('codigoTopo').textContent = codigo;
 
 let telaAtual = 'cadastro';
-let tipoProvaAtual = 'eliminatorias';   // controla se "telaProva" está mostrando eliminatória ou final
-let origemCadastro = 'eliminatorias';   // pra onde "Adicionar à prova" manda quando estamos no Cadastro
+let tipoProvaAtual = 'eliminatorias';
+let origemCadastro = 'eliminatorias';
 
 const CHAVE_CADASTRO = 'md_cadastro_' + codigo;
+const CHAVE_RESULTADOS = 'md_resultados_' + codigo;
 
 function carregarCadastro() {
   try { return JSON.parse(localStorage.getItem(CHAVE_CADASTRO)) || []; }
@@ -605,6 +649,30 @@ function carregarCadastro() {
 }
 function salvarCadastro(lista) {
   localStorage.setItem(CHAVE_CADASTRO, JSON.stringify(lista));
+}
+
+// ═══════ ARQUIVO LOCAL DE RESULTADOS (sobrevive a reinício do servidor) ═══════
+function carregarResultadosLocais() {
+  try { return JSON.parse(localStorage.getItem(CHAVE_RESULTADOS)) || {}; }
+  catch (e) { return {}; }
+}
+function salvarResultadosLocais(obj) {
+  localStorage.setItem(CHAVE_RESULTADOS, JSON.stringify(obj));
+}
+function mesclarResultadosLocais(tipo, itens) {
+  const armazenado = carregarResultadosLocais();
+  itens.forEach(item => {
+    const chave = tipo + ':' + item.id;
+    armazenado[chave] = {
+      nome: item.nome, anilha: item.anilha || '', proprietario: item.proprietario || '',
+      tipo: tipo, tempo_texto: item.tempo_texto, tempo_segundos: item.tempo_segundos,
+    };
+  });
+  salvarResultadosLocais(armazenado);
+}
+
+function marcarOffline(offline) {
+  document.getElementById('avisoOffline').classList.toggle('mostrar', offline);
 }
 
 function copiarLinkCelular() {
@@ -633,7 +701,7 @@ function mostrarTela(nome) {
     document.getElementById('btnClassificar').style.display = nome === 'eliminatorias' ? 'inline-block' : 'none';
     atualizarProva();
   }
-  if (nome === 'geral') { atualizarGeral(); }
+  if (nome === 'geral') { renderGeral(); }
 }
 
 function irParaCadastro() {
@@ -648,13 +716,14 @@ function renderCadastro() {
   const lista = carregarCadastro();
   const tbody = document.querySelector('#tabelaCadastro tbody');
   if (lista.length === 0) {
-    tbody.innerHTML = '<tr><td class="vazio" colspan="2">nenhum pássaro cadastrado ainda</td></tr>';
+    tbody.innerHTML = '<tr><td class="vazio" colspan="4">nenhum pássaro cadastrado ainda</td></tr>';
     return;
   }
   tbody.innerHTML = '';
   lista.forEach((p, i) => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${p.nome}</td><td style="text-align:right; white-space:nowrap;">
+    tr.innerHTML = `<td>${p.nome}</td><td>${p.anilha || ''}</td><td>${p.proprietario || ''}</td>
+      <td style="text-align:right; white-space:nowrap;">
       <button class="btn-cinza" style="padding:4px 8px; font-size:11px;" onclick="editarPassaroCadastro(${i})">✏️</button>
       <button class="btn-vermelho" style="padding:4px 8px; font-size:11px;" onclick="removerPassaroCadastro(${i})">🗑️</button>
     </td>`;
@@ -663,24 +732,30 @@ function renderCadastro() {
 }
 
 function adicionarPassaroCadastro() {
-  const input = document.getElementById('nomeNovoPassaro');
-  const nome = input.value.trim();
+  const nomeEl = document.getElementById('nomeNovoPassaro');
+  const anilhaEl = document.getElementById('anilhaNovoPassaro');
+  const propEl = document.getElementById('proprietarioNovoPassaro');
+  const nome = nomeEl.value.trim();
   if (!nome) return;
   const lista = carregarCadastro();
-  lista.push({ nome });
+  lista.push({ nome, anilha: anilhaEl.value.trim(), proprietario: propEl.value.trim() });
   salvarCadastro(lista);
-  input.value = '';
+  nomeEl.value = ''; anilhaEl.value = ''; propEl.value = '';
   renderCadastro();
 }
 
 function editarPassaroCadastro(i) {
   const lista = carregarCadastro();
-  const novoNome = prompt('Novo nome:', lista[i].nome);
-  if (novoNome && novoNome.trim()) {
-    lista[i].nome = novoNome.trim();
-    salvarCadastro(lista);
-    renderCadastro();
-  }
+  const p = lista[i];
+  const novoNome = prompt('Nome:', p.nome);
+  if (novoNome === null) return;
+  const novaAnilha = prompt('Anilha:', p.anilha || '');
+  if (novaAnilha === null) return;
+  const novoProp = prompt('Proprietário:', p.proprietario || '');
+  if (novoProp === null) return;
+  lista[i] = { nome: novoNome.trim(), anilha: novaAnilha.trim(), proprietario: novoProp.trim() };
+  salvarCadastro(lista);
+  renderCadastro();
 }
 
 function removerPassaroCadastro(i) {
@@ -693,51 +768,90 @@ function removerPassaroCadastro(i) {
 async function adicionarTodosAProva() {
   const lista = carregarCadastro();
   if (lista.length === 0) { alert('Cadastre pelo menos um pássaro primeiro.'); return; }
-  const resp = await fetch(`/api/sala/${codigo}/cadastrar_prova`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ tipo: origemCadastro, passaros: lista })
-  });
-  const data = await resp.json();
-  if (data.ok) {
-    alert(`${lista.length} pássaro(s) adicionados à ${origemCadastro === 'eliminatorias' ? 'Eliminatória' : 'Final'}.`);
-    mostrarTela(origemCadastro);
-  } else {
-    alert('Erro: ' + (data.erro || 'desconhecido'));
+  try {
+    const resp = await fetch(`/api/sala/${codigo}/cadastrar_prova`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ tipo: origemCadastro, passaros: lista })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      marcarOffline(false);
+      alert(`${lista.length} pássaro(s) adicionados à ${origemCadastro === 'eliminatorias' ? 'Eliminatória' : 'Final'}.`);
+      mostrarTela(origemCadastro);
+    } else {
+      alert('Erro: ' + (data.erro || 'desconhecido'));
+    }
+  } catch (e) {
+    marcarOffline(true);
+    alert('Sem conexão com o servidor da sala agora. Tenta de novo em alguns segundos.');
   }
 }
 
 // ═══════ PROVA (Eliminatória / Final) ═══════
+function formatarMMSS(segundos) {
+  segundos = Math.max(0, Math.round(segundos));
+  const mm = String(Math.floor(segundos / 60)).padStart(2, '0');
+  const ss = String(segundos % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
 async function atualizarProva() {
   if (telaAtual !== 'eliminatorias' && telaAtual !== 'final') return;
   try {
     const resp = await fetch(`/api/sala/${codigo}/prova/${tipoProvaAtual}`);
     const data = await resp.json();
-    if (!data.ok) return;
+    if (!data.ok) { marcarOffline(true); return; }
+    marcarOffline(false);
+
     const status = data.finalizada ? 'finalizada' : (data.ativa ? 'em andamento' : 'aguardando início');
-    document.getElementById('statusProva').textContent =
-      `${data.itens.length} pássaro(s) — prova ${status}`;
+    document.getElementById('statusProva').textContent = `${data.itens.length} pássaro(s) — prova ${status}`;
+
+    const blocoRelogio = document.getElementById('blocoRelogio');
+    if (data.ativa) {
+      blocoRelogio.style.display = 'block';
+      blocoRelogio.classList.toggle('acabando', data.tempo_restante <= 30);
+      document.getElementById('relogioNumero').textContent = formatarMMSS(data.tempo_restante);
+      document.getElementById('relogioLegenda').textContent = 'tempo restante da prova (finaliza sozinho)';
+    } else if (data.finalizada) {
+      blocoRelogio.style.display = 'block';
+      blocoRelogio.classList.remove('acabando');
+      document.getElementById('relogioNumero').textContent = '00:00';
+      document.getElementById('relogioLegenda').textContent = 'prova finalizada';
+    } else {
+      blocoRelogio.style.display = 'none';
+    }
+
     const tbody = document.querySelector('#tabelaProva tbody');
     if (data.itens.length === 0) {
-      tbody.innerHTML = '<tr><td class="vazio" colspan="3">nenhum pássaro nesta prova ainda</td></tr>';
+      tbody.innerHTML = '<tr><td class="vazio" colspan="5">nenhum pássaro nesta prova ainda</td></tr>';
     } else {
       tbody.innerHTML = '';
       data.itens.forEach(item => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${item.nome}</td>
+        tr.innerHTML = `<td>${item.nome}</td><td>${item.anilha || ''}</td><td>${item.proprietario || ''}</td>
           <td><span class="tag ${item.vinculado ? 'tag-ok' : 'tag-nao'}">${item.vinculado ? 'sim' : 'não'}</span></td>
           <td style="font-family:monospace">${item.tempo_texto}</td>`;
         tbody.appendChild(tr);
       });
     }
-  } catch (e) { /* silencioso: só tenta de novo no próximo ciclo */ }
+    mesclarResultadosLocais(tipoProvaAtual, data.itens);
+  } catch (e) {
+    marcarOffline(true);
+  }
 }
 
 async function acaoProva(acao) {
   if (acao === 'limpar' && !confirm('Tem certeza? Isso apaga os tempos e desvincula os celulares dessa prova.')) return;
   if (acao === 'finalizar' && !confirm('Finalizar esta prova? Os celulares vinculados serão travados.')) return;
-  const resp = await fetch(`/api/sala/${codigo}/prova/${tipoProvaAtual}/${acao}`, { method: 'POST' });
-  const data = await resp.json();
-  if (!data.ok) alert('Erro: ' + (data.erro || 'desconhecido'));
+  try {
+    const resp = await fetch(`/api/sala/${codigo}/prova/${tipoProvaAtual}/${acao}`, { method: 'POST' });
+    const data = await resp.json();
+    if (!data.ok) alert('Erro: ' + (data.erro || 'desconhecido'));
+    marcarOffline(false);
+  } catch (e) {
+    marcarOffline(true);
+    alert('Sem conexão com o servidor da sala agora.');
+  }
   atualizarProva();
 }
 
@@ -747,54 +861,60 @@ async function classificarParaFinal() {
   if (qtdStr === null) return;
   const qtd = parseInt(qtdStr, 10);
   if (isNaN(qtd) || qtd < 0) { alert('Número inválido.'); return; }
-  const resp = await fetch(`/api/sala/${codigo}/classificar`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ quantidade: qtd })
-  });
-  const data = await resp.json();
-  if (data.ok) {
-    alert(`${data.classificados} pássaro(s) classificados para a Final.`);
-  } else {
-    alert('Erro ao classificar.');
+  try {
+    const resp = await fetch(`/api/sala/${codigo}/classificar`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ quantidade: qtd })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      alert(`${data.classificados} pássaro(s) classificados para a Final.`);
+    } else {
+      alert('Erro ao classificar.');
+    }
+  } catch (e) {
+    marcarOffline(true);
+    alert('Sem conexão com o servidor da sala agora.');
   }
 }
 
-// ═══════ RESULTADO GERAL ═══════
-async function atualizarGeral() {
-  try {
-    const resp = await fetch(`/api/sala/${codigo}/ranking_geral`);
-    const data = await resp.json();
-    if (!data.ok) return;
-    const tbody = document.querySelector('#tabelaGeral tbody');
-    if (data.ranking.length === 0) {
-      tbody.innerHTML = '<tr><td class="vazio" colspan="4">ainda sem resultados</td></tr>';
-      return;
-    }
-    tbody.innerHTML = '';
-    data.ranking.forEach(r => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${r.posicao}º</td><td>${r.nome}</td>
-        <td>${r.tipo === 'eliminatorias' ? 'Eliminatória' : 'Final'}</td>
-        <td style="font-family:monospace">${r.tempo_texto}</td>`;
-      tbody.appendChild(tr);
-    });
-  } catch (e) {}
-}
-
-function salvarResultadoNoNavegador() {
-  fetch(`/api/sala/${codigo}/ranking_geral`).then(r => r.json()).then(data => {
-    if (!data.ok) return;
-    const chave = 'md_resultado_' + codigo + '_' + new Date().toISOString().slice(0,10);
-    localStorage.setItem(chave, JSON.stringify(data.ranking));
-    alert('Resultado salvo neste navegador.');
+// ═══════ RESULTADO GERAL (lê do arquivo local — sobrevive a reinício do servidor) ═══════
+function renderGeral() {
+  const armazenado = carregarResultadosLocais();
+  const lista = Object.values(armazenado);
+  lista.sort((a, b) => b.tempo_segundos - a.tempo_segundos);
+  const tbody = document.querySelector('#tabelaGeral tbody');
+  if (lista.length === 0) {
+    tbody.innerHTML = '<tr><td class="vazio" colspan="6">ainda sem resultados</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  lista.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i + 1}º</td><td>${r.nome}</td><td>${r.anilha || ''}</td><td>${r.proprietario || ''}</td>
+      <td>${r.tipo === 'eliminatorias' ? 'Eliminatória' : 'Final'}</td>
+      <td style="font-family:monospace">${r.tempo_texto}</td>`;
+    tbody.appendChild(tr);
   });
 }
 
-// ═══════ ATUALIZAÇÃO PERIÓDICA ═══════
+// ═══════ SINCRONIZAÇÃO DE FUNDO (mantém o arquivo local sempre atualizado,
+// mesmo que o organizador esteja numa aba diferente) ═══════
+async function sincronizarFundo() {
+  for (const tipo of ['eliminatorias', 'final']) {
+    try {
+      const resp = await fetch(`/api/sala/${codigo}/prova/${tipo}`);
+      const data = await resp.json();
+      if (data.ok) mesclarResultadosLocais(tipo, data.itens);
+    } catch (e) { /* servidor fora do ar — os dados que já tem continuam salvos */ }
+  }
+  if (telaAtual === 'geral') renderGeral();
+}
+
 setInterval(() => {
   if (telaAtual === 'eliminatorias' || telaAtual === 'final') atualizarProva();
-  if (telaAtual === 'geral') atualizarGeral();
 }, 1000);
+setInterval(sincronizarFundo, 2000);
 
 mostrarTela('cadastro');
 </script>
@@ -852,6 +972,12 @@ HTML_CELULAR = """<!DOCTYPE html>
     </div>
   </div>
 </div>
+
+<!-- vídeo mudo de 1x1, só pra impedir a tela de apagar em navegadores que não
+     têm a Screen Wake Lock API (recebe uma "gravação" ao vivo de um canvas
+     parado, gerada na hora — não precisa de nenhum arquivo de vídeo) -->
+<video id="videoNoSleep" muted playsinline loop
+       style="position:fixed; top:0; left:0; width:1px; height:1px; opacity:0.01; pointer-events:none;"></video>
 
 <script>
 const codigo = location.pathname.split('/').pop().toUpperCase();
@@ -1021,6 +1147,7 @@ function montarLista(elId, itens, tipo) {
 }
 
 async function vincularPassaro(tipo, itemId) {
+  ativarProtecaoDeTela();
   try {
     const resp = await fetch(`/api/sala/${codigo}/vincular`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1062,10 +1189,45 @@ let wakeLock = null;
 async function pedirWakeLock() {
   try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
 }
-document.addEventListener('visibilitychange', async () => {
-  if (wakeLock !== null && document.visibilityState === 'visible') await pedirWakeLock();
+
+// Fallback pra navegadores que não suportam a Screen Wake Lock API (ex.: iOS
+// mais antigo) ou que exigem um toque do usuário antes de liberar: mantém um
+// vídeo "ao vivo" (gerado na hora por um canvas parado) tocando em loop, o
+// que também impede a tela de apagar em muitos navegadores.
+const videoNoSleep = document.getElementById('videoNoSleep');
+try {
+  const canvas = document.createElement('canvas');
+  canvas.width = 2; canvas.height = 2;
+  const ctx = canvas.getContext('2d');
+  ctx.fillRect(0, 0, 2, 2);
+  if (canvas.captureStream) {
+    videoNoSleep.srcObject = canvas.captureStream(1);
+  }
+} catch (e) {}
+
+function iniciarNoSleepFallback() {
+  if (videoNoSleep && videoNoSleep.srcObject) {
+    videoNoSleep.play().catch(() => {});
+  }
+}
+
+function ativarProtecaoDeTela() {
+  pedirWakeLock();
+  iniciarNoSleepFallback();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') ativarProtecaoDeTela();
 });
-pedirWakeLock();
+
+// Pede assim que a página carrega...
+ativarProtecaoDeTela();
+// ...e de novo no primeiro toque na tela (alguns navegadores só liberam a
+// trava de tela depois de uma interação real do usuário).
+document.addEventListener('touchstart', ativarProtecaoDeTela, { once: true });
+document.addEventListener('click', ativarProtecaoDeTela, { once: true });
+// Reforça periodicamente, caso o navegador solte a trava sozinho.
+setInterval(ativarProtecaoDeTela, 20000);
 
 carregarPassaros();
 setInterval(carregarPassaros, 5000);
