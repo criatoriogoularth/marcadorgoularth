@@ -2,7 +2,6 @@ import os
 import re
 import threading
 import datetime
-import json
 
 import psycopg2
 import psycopg2.extras
@@ -17,10 +16,7 @@ DATABASE_URL = os.environ.get('DATABASE_URL', '')
 _pool = None
 _pool_lock = threading.Lock()
 
-# Configurações do admin (armazenadas no banco)
-ADMIN_CONFIG_TABLE = "admin_config"
 ADMIN_DEFAULT_PASSWORD = "123456"
-ADMIN_DEFAULT_IMAGE = ""  # URL da imagem padrão
 
 
 def _obter_pool():
@@ -38,9 +34,6 @@ def _obter_pool():
 
 
 class conexao:
-    """Context manager: pega uma conexão do pool, comita se deu tudo
-    certo, devolve pro pool sempre. Uso: `with conexao() as cur: ...`"""
-
     def __enter__(self):
         self._conn = _obter_pool().getconn()
         self._cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -127,14 +120,14 @@ def inicializar_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_sala ON logs_acesso (sala_codigo);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_data ON logs_acesso (data_hora);")
         
-        # Inserir configurações padrão do admin se não existirem
+        # Inserir configurações padrão do admin
         cur.execute(
             "INSERT INTO admin_config (chave, valor) VALUES (%s, %s) ON CONFLICT (chave) DO NOTHING",
             ("senha_admin", ADMIN_DEFAULT_PASSWORD)
         )
         cur.execute(
             "INSERT INTO admin_config (chave, valor) VALUES (%s, %s) ON CONFLICT (chave) DO NOTHING",
-            ("imagem_botao", ADMIN_DEFAULT_IMAGE)
+            ("imagem_botao", "")
         )
 
 
@@ -226,7 +219,6 @@ def tocar_sala(codigo):
 
 
 def registrar_acesso(codigo, tipo_acesso, esp32_id=None, ip=None, user_agent=None):
-    """Registra um acesso à sala para estatísticas."""
     try:
         with conexao() as cur:
             if codigo:
@@ -260,43 +252,34 @@ def definir_quantidade_classificados(codigo, qtd):
 # ════════════════════════════════════════════════════════════════════
 
 def obter_estatisticas():
-    """Retorna estatísticas gerais do sistema."""
     with conexao() as cur:
-        # Total de salas
         cur.execute("SELECT COUNT(*) AS total FROM salas")
         total_salas = cur.fetchone()['total']
         
-        # Salas ativas (com uso nas últimas 24h)
         cur.execute(
             "SELECT COUNT(*) AS ativas FROM salas WHERE ultimo_uso > now() - interval '24 hours'"
         )
         salas_ativas = cur.fetchone()['ativas']
         
-        # Total de acessos
         cur.execute("SELECT COALESCE(SUM(acessos_total), 0) AS total FROM salas")
         total_acessos = cur.fetchone()['total']
         
-        # Acessos nas últimas 24h
         cur.execute(
             "SELECT COUNT(*) AS total FROM logs_acesso WHERE data_hora > now() - interval '24 hours'"
         )
         acessos_24h = cur.fetchone()['total']
         
-        # Dispositivos únicos (esp32_id) nas últimas 24h
         cur.execute(
             "SELECT COUNT(DISTINCT esp32_id) AS total FROM logs_acesso WHERE esp32_id IS NOT NULL AND data_hora > now() - interval '24 hours'"
         )
         dispositivos_24h = cur.fetchone()['total']
         
-        # Pássaros vinculados agora (esp32_id não nulo)
         cur.execute("SELECT COUNT(DISTINCT esp32_id) AS total FROM itens WHERE esp32_id IS NOT NULL")
         vinculados_agora = cur.fetchone()['total']
         
-        # Provas em andamento
         cur.execute("SELECT COUNT(*) AS total FROM provas WHERE ativa = true")
         provas_ativas = cur.fetchone()['total']
         
-        # Logs por tipo de acesso (últimas 24h)
         cur.execute("""
             SELECT tipo_acesso, COUNT(*) AS total 
             FROM logs_acesso 
@@ -305,18 +288,16 @@ def obter_estatisticas():
         """)
         logs_por_tipo = {row['tipo_acesso']: row['total'] for row in cur.fetchall()}
         
-        # Total de pássaros cadastrados
         cur.execute("SELECT COUNT(*) AS total FROM itens")
         total_passaros = cur.fetchone()['total']
         
-        # Salas mais acessadas
         cur.execute("""
             SELECT codigo, acessos_total, ultimo_uso
             FROM salas 
             ORDER BY acessos_total DESC 
             LIMIT 10
         """)
-        salas_top = cur.fetchall()
+        salas_top = [dict(row) for row in cur.fetchall()]
         
         return {
             "total_salas": total_salas,
@@ -330,12 +311,11 @@ def obter_estatisticas():
             "acessos_organizador": logs_por_tipo.get('organizador', 0),
             "acessos_celular": logs_por_tipo.get('celular', 0),
             "acessos_api": logs_por_tipo.get('api', 0),
-            "salas_top": [dict(row) for row in salas_top],
+            "salas_top": salas_top,
         }
 
 
 def obter_logs_recentes(limite=50):
-    """Retorna os logs mais recentes."""
     with conexao() as cur:
         cur.execute("""
             SELECT id, sala_codigo, tipo_acesso, esp32_id, ip, data_hora
@@ -389,8 +369,6 @@ def ver_prova(codigo, tipo):
 
 
 def iniciar_prova(codigo, tipo):
-    """Retorna None se não tem pássaro nenhum na prova (não inicia).
-    Senão, retorna {"duracao": int, "vinculados": [esp32_id, ...]}."""
     with conexao() as cur:
         cur.execute("SELECT COUNT(*) AS n FROM itens WHERE sala_codigo = %s AND tipo = %s", (codigo, tipo))
         if cur.fetchone()['n'] == 0:
@@ -497,9 +475,7 @@ def vincular(codigo, tipo, item_id, esp32_id):
         if item['esp32_id']:
             return {"ok": False, "erro": "esse pássaro já está vinculado a outro celular"}
 
-        # se esse celular já estava noutro pássaro, desvincula de lá primeiro
         cur.execute("UPDATE itens SET esp32_id = NULL WHERE sala_codigo = %s AND esp32_id = %s", (codigo, esp32_id))
-
         cur.execute("UPDATE itens SET esp32_id = %s WHERE id = %s", (esp32_id, item_id))
         cur.execute(
             "SELECT ativa, duracao, iniciada_em FROM provas WHERE sala_codigo = %s AND tipo = %s",
@@ -522,8 +498,6 @@ def desvincular(codigo, tipo, item_id):
 
 
 def tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_segundos):
-    """Atualiza o tempo do pássaro vinculado a esse esp32_id (se a prova
-    dele estiver ativa). Retorna (tipo, item_id) do vínculo atual, ou None."""
     with conexao() as cur:
         cur.execute(
             """SELECT i.id, i.tipo, p.ativa FROM itens i
@@ -572,8 +546,6 @@ def ranking_geral(codigo):
 # ════════════════════════════════════════════════════════════════════
 
 def provas_para_finalizar_automaticamente():
-    """Provas ativas cujo tempo já bateu zero. Finaliza e devolve, por
-    sala/tipo, a lista de esp32_id vinculados (pra mandar FINALIZAR)."""
     with conexao() as cur:
         cur.execute(
             """SELECT sala_codigo, tipo, duracao, iniciada_em FROM provas
