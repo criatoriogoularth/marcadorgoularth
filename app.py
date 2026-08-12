@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import random
 import string
@@ -7,106 +6,35 @@ import threading
 
 from flask import Flask, request, jsonify
 
+import db
+
 app = Flask(__name__)
 
 # ════════════════════════════════════════════════════════════════════
-# MOTOR DA SALA (tudo em memória — sem banco de dados)
+# ESTADO EFÊMERO (só isso continua em memória — não precisa sobreviver
+# a reinício do servidor, porque o vínculo em si já está salvo no
+# banco). São só os comandos "pendentes de entrega" pro celular
+# (NOME:/PROVA:/RESET/FINALIZAR) até a próxima vez que ele der um tick.
 # ════════════════════════════════════════════════════════════════════
-# Cada "sala" é um dicionário isolado, identificado por um código curto.
-# O organizador manda o cadastro (que mora no localStorage do navegador
-# dele) pra virar a "prova" viva aqui; os celulares linkam nos pássaros
-# dessa prova e mandam o tempo em tempo real; o organizador fica lendo
-# (polling) pra atualizar a tela dele. Se o servidor reiniciar, a sala
-# se perde — mas o cadastro e os resultados salvos continuam no
-# navegador do organizador.
 
-salas = {}
-salas_lock = threading.Lock()
+conexoes_lock = threading.Lock()
+conexoes = {}   # esp32_id -> {"fila_saida": [...], "ultimo_tick": ts}
 
-DURACAO_PADRAO = {"eliminatorias": 600, "final": 900}   # 10 min / 15 min, fixos
+
+def empurrar_comandos(esp32_id, comandos):
+    if not esp32_id or not comandos:
+        return
+    with conexoes_lock:
+        c = conexoes.setdefault(esp32_id, {"fila_saida": [], "ultimo_tick": time.time()})
+        c["fila_saida"].extend(comandos)
 
 
 def novo_codigo_sala():
     alfabeto = string.ascii_uppercase + string.digits
     while True:
         codigo = ''.join(random.choice(alfabeto) for _ in range(6))
-        with salas_lock:
-            if codigo not in salas:
-                return codigo
-
-
-def nova_prova(tipo):
-    return {
-        "duracao": DURACAO_PADRAO[tipo],
-        "ativa": False,
-        "finalizada": False,
-        "iniciada_em": None,
-        "itens": {},   # item_id -> {"nome", "esp32_id", "tempo_texto", "tempo_segundos"}
-    }
-
-
-def nova_sala():
-    return {
-        "criada_em": time.time(),
-        "ultimo_uso": time.time(),
-        "lock": threading.Lock(),
-        "quantidade_classificados": 15,
-        "proximo_id": 1,
-        "provas": {
-            "eliminatorias": nova_prova("eliminatorias"),
-            "final": nova_prova("final"),
-        },
-        # esp32_id -> {"fila_saida": [...], "ultimo_tick": ts, "vinculo": (tipo, item_id)|None}
-        "conexoes": {},
-    }
-
-
-def obter_sala(codigo):
-    with salas_lock:
-        sala = salas.get((codigo or "").upper())
-        if sala:
-            sala["ultimo_uso"] = time.time()
-        return sala
-
-
-def validar_tempo(txt):
-    return re.match(r"^\d{2}:\d{2}:\d{3}$", txt or "") is not None
-
-
-def tempo_para_segundos(txt):
-    try:
-        mm, ss, mmm = txt.split(":")
-        return int(mm) * 60 + int(ss) + int(mmm) / 1000.0
-    except Exception:
-        return 0.0
-
-
-def formatar_tempo(seg):
-    if seg < 0:
-        seg = 0
-    mm = int(seg // 60)
-    ss = int(seg % 60)
-    mmm = int(round((seg - int(seg)) * 1000))
-    return f"{mm:02d}:{ss:02d}:{mmm:03d}"
-
-
-def tempo_restante(prova):
-    if not prova["iniciada_em"]:
-        return prova["duracao"]
-    decorrido = time.time() - prova["iniciada_em"]
-    return max(0, prova["duracao"] - decorrido)
-
-
-def empurrar_comando(sala, esp32_id, comando):
-    conexao = sala["conexoes"].get(esp32_id)
-    if conexao:
-        conexao["fila_saida"].append(comando)
-
-
-def obter_ou_criar_conexao(sala, esp32_id):
-    return sala["conexoes"].setdefault(
-        esp32_id, {"fila_saida": [], "ultimo_tick": time.time(), "vinculo": None}
-    )
+        if not db.sala_existe(codigo):
+            return codigo
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -116,14 +44,13 @@ def obter_ou_criar_conexao(sala, esp32_id):
 @app.route('/api/sala/criar', methods=['POST'])
 def api_criar_sala():
     codigo = novo_codigo_sala()
-    with salas_lock:
-        salas[codigo] = nova_sala()
+    db.criar_sala(codigo)
     return jsonify({"ok": True, "codigo": codigo})
 
 
 @app.route('/api/sala/<codigo>/existe')
 def api_sala_existe(codigo):
-    return jsonify({"ok": True, "existe": obter_sala(codigo) is not None})
+    return jsonify({"ok": True, "existe": db.sala_existe(codigo.upper())})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -132,30 +59,15 @@ def api_sala_existe(codigo):
 
 @app.route('/api/sala/<codigo>/cadastrar_prova', methods=['POST'])
 def api_cadastrar_prova(codigo):
-    sala = obter_sala(codigo)
-    if not sala:
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
         return jsonify({"ok": False, "erro": "sala não encontrada"}), 404
     dados = request.get_json(force=True) or {}
     tipo = dados.get('tipo')
     passaros = dados.get('passaros', [])
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False, "erro": "tipo inválido"}), 400
-    with sala['lock']:
-        prova = sala['provas'][tipo]
-        for p in passaros:
-            nome = str(p.get('nome', '')).strip()[:40]
-            if not nome:
-                continue
-            item_id = str(sala['proximo_id'])
-            sala['proximo_id'] += 1
-            prova['itens'][item_id] = {
-                "nome": nome,
-                "anilha": str(p.get('anilha', '')).strip()[:20],
-                "proprietario": str(p.get('proprietario', '')).strip()[:40],
-                "esp32_id": None,
-                "tempo_texto": "00:00:000",
-                "tempo_segundos": 0.0,
-            }
+    db.cadastrar_prova(codigo, tipo, passaros)
     return jsonify({"ok": True})
 
 
@@ -165,78 +77,68 @@ def api_cadastrar_prova(codigo):
 
 @app.route('/api/sala/<codigo>/prova/<tipo>')
 def api_ver_prova(codigo, tipo):
-    sala = obter_sala(codigo)
-    if not sala or tipo not in ('eliminatorias', 'final'):
+    codigo = codigo.upper()
+    if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
-    with sala['lock']:
-        prova = sala['provas'][tipo]
-        itens = [
-            {
-                "id": iid,
-                "nome": item["nome"],
-                "anilha": item.get("anilha", ""),
-                "proprietario": item.get("proprietario", ""),
-                "vinculado": item["esp32_id"] is not None,
-                "tempo_texto": item["tempo_texto"],
-                "tempo_segundos": item["tempo_segundos"],
-            }
-            for iid, item in prova['itens'].items()
-        ]
-        itens.sort(key=lambda x: x['tempo_segundos'], reverse=True)
-        resp = {
-            "ok": True,
-            "ativa": prova['ativa'],
-            "finalizada": prova['finalizada'],
-            "duracao": prova['duracao'],
-            "tempo_restante": tempo_restante(prova) if prova['ativa'] else prova['duracao'],
-            "itens": itens,
+    resultado = db.ver_prova(codigo, tipo)
+    if resultado is None:
+        return jsonify({"ok": False}), 404
+    prova = resultado['prova']
+    itens = [
+        {
+            "id": it['id'],
+            "nome": it['nome'],
+            "anilha": it['anilha'],
+            "proprietario": it['proprietario'],
+            "vinculado": it['esp32_id'] is not None,
+            "tempo_texto": it['tempo_texto'],
+            "tempo_segundos": it['tempo_segundos'],
         }
-    return jsonify(resp)
+        for it in resultado['itens']
+    ]
+    return jsonify({
+        "ok": True,
+        "ativa": prova['ativa'],
+        "finalizada": prova['finalizada'],
+        "duracao": prova['duracao'],
+        "tempo_restante": db.tempo_restante_segundos(prova),
+        "itens": itens,
+    })
 
 
 @app.route('/api/sala/<codigo>/prova/<tipo>/iniciar', methods=['POST'])
 def api_iniciar_prova(codigo, tipo):
-    sala = obter_sala(codigo)
-    if not sala or tipo not in ('eliminatorias', 'final'):
+    codigo = codigo.upper()
+    if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
-    with sala['lock']:
-        prova = sala['provas'][tipo]
-        if not prova['itens']:
-            return jsonify({"ok": False, "erro": "nenhum pássaro nessa prova"}), 400
-        prova['ativa'] = True
-        prova['finalizada'] = False
-        prova['iniciada_em'] = time.time()
-        restante_txt = formatar_tempo(prova['duracao'])
-        for item in prova['itens'].values():
-            if item['esp32_id']:
-                empurrar_comando(sala, item['esp32_id'], f"PROVA:{restante_txt}")
+    resultado = db.iniciar_prova(codigo, tipo)
+    if resultado is None:
+        return jsonify({"ok": False, "erro": "nenhum pássaro nessa prova"}), 400
+    restante_txt = db.formatar_tempo(resultado['duracao'])
+    for esp32_id in resultado['vinculados']:
+        empurrar_comandos(esp32_id, [f"PROVA:{restante_txt}"])
     return jsonify({"ok": True})
 
 
 @app.route('/api/sala/<codigo>/prova/<tipo>/finalizar', methods=['POST'])
 def api_finalizar_prova(codigo, tipo):
-    sala = obter_sala(codigo)
-    if not sala or tipo not in ('eliminatorias', 'final'):
+    codigo = codigo.upper()
+    if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
-    with sala['lock']:
-        _finalizar_prova_interno(sala, tipo)
+    vinculados = db.finalizar_prova(codigo, tipo)
+    for esp32_id in vinculados:
+        empurrar_comandos(esp32_id, ["FINALIZAR"])
     return jsonify({"ok": True})
 
 
 @app.route('/api/sala/<codigo>/prova/<tipo>/limpar', methods=['POST'])
 def api_limpar_prova(codigo, tipo):
-    sala = obter_sala(codigo)
-    if not sala or tipo not in ('eliminatorias', 'final'):
+    codigo = codigo.upper()
+    if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
-    with sala['lock']:
-        prova = sala['provas'][tipo]
-        for item in prova['itens'].values():
-            if item['esp32_id']:
-                empurrar_comando(sala, item['esp32_id'], "RESET")
-                conexao = sala['conexoes'].get(item['esp32_id'])
-                if conexao:
-                    conexao['vinculo'] = None
-        sala['provas'][tipo] = nova_prova(tipo)
+    vinculados = db.limpar_prova(codigo, tipo)
+    for esp32_id in vinculados:
+        empurrar_comandos(esp32_id, ["RESET"])
     return jsonify({"ok": True})
 
 
@@ -246,36 +148,17 @@ def api_limpar_prova(codigo, tipo):
 
 @app.route('/api/sala/<codigo>/classificar', methods=['POST'])
 def api_classificar(codigo):
-    sala = obter_sala(codigo)
-    if not sala:
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
         return jsonify({"ok": False}), 404
     dados = request.get_json(force=True) or {}
-    with sala['lock']:
-        try:
-            qtd = int(dados.get('quantidade', sala['quantidade_classificados']))
-        except (TypeError, ValueError):
-            qtd = sala['quantidade_classificados']
-        qtd = max(0, qtd)
-        sala['quantidade_classificados'] = qtd
-
-        elim = sala['provas']['eliminatorias']
-        ranking = sorted(elim['itens'].items(), key=lambda kv: kv[1]['tempo_segundos'], reverse=True)
-        classificados = ranking[:qtd]   # lista de (elim_id, item)
-
-        final = sala['provas']['final']
-        for elim_id, item in classificados:
-            item_id = str(sala['proximo_id'])
-            sala['proximo_id'] += 1
-            final['itens'][item_id] = {
-                "nome": item['nome'],
-                "anilha": item.get('anilha', ''),
-                "proprietario": item.get('proprietario', ''),
-                "esp32_id": None,
-                "tempo_texto": "00:00:000",
-                "tempo_segundos": 0.0,
-                "origem_id": elim_id,   # liga de volta ao tempo da eliminatória
-            }
-    return jsonify({"ok": True, "classificados": len(classificados)})
+    try:
+        qtd = int(dados.get('quantidade', db.obter_quantidade_classificados(codigo)))
+    except (TypeError, ValueError):
+        qtd = db.obter_quantidade_classificados(codigo)
+    qtd = max(0, qtd)
+    total = db.classificar(codigo, qtd)
+    return jsonify({"ok": True, "classificados": total})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -284,94 +167,75 @@ def api_classificar(codigo):
 
 @app.route('/api/sala/<codigo>/passaros_livres/<tipo>')
 def api_passaros_livres(codigo, tipo):
-    sala = obter_sala(codigo)
-    if not sala or tipo not in ('eliminatorias', 'final'):
+    codigo = codigo.upper()
+    if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
-    with sala['lock']:
-        prova = sala['provas'][tipo]
-        livres = [
-            {"id": iid, "nome": item['nome']}
-            for iid, item in prova['itens'].items() if not item['esp32_id']
-        ]
-    return jsonify({"ok": True, "itens": livres})
+    itens = db.passaros_livres(codigo, tipo)
+    return jsonify({"ok": True, "itens": [{"id": it['id'], "nome": it['nome']} for it in itens]})
 
 
 @app.route('/api/sala/<codigo>/vincular', methods=['POST'])
 def api_vincular(codigo):
-    sala = obter_sala(codigo)
-    if not sala:
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
         return jsonify({"ok": False, "erro": "sala não encontrada"}), 404
     dados = request.get_json(force=True) or {}
     tipo = dados.get('tipo')
-    item_id = str(dados.get('item_id', ''))
     esp32_id = dados.get('esp32_id')
-    if tipo not in ('eliminatorias', 'final') or not item_id or not esp32_id:
+    try:
+        item_id = int(dados.get('item_id'))
+    except (TypeError, ValueError):
         return jsonify({"ok": False, "erro": "parâmetros inválidos"}), 400
-    with sala['lock']:
-        prova = sala['provas'][tipo]
-        item = prova['itens'].get(item_id)
-        if not item:
-            return jsonify({"ok": False, "erro": "pássaro não encontrado"}), 404
-        if item['esp32_id']:
-            return jsonify({"ok": False, "erro": "esse pássaro já está vinculado a outro celular"}), 409
+    if tipo not in ('eliminatorias', 'final') or not esp32_id:
+        return jsonify({"ok": False, "erro": "parâmetros inválidos"}), 400
 
-        conexao = obter_ou_criar_conexao(sala, esp32_id)
-        if conexao['vinculo']:
-            v_tipo, v_item = conexao['vinculo']
-            outro = sala['provas'][v_tipo]['itens'].get(v_item)
-            if outro:
-                outro['esp32_id'] = None
+    resultado = db.vincular(codigo, tipo, item_id, esp32_id)
+    if not resultado['ok']:
+        status = 409 if 'já está vinculado' in resultado.get('erro', '') else 404
+        return jsonify(resultado), status
 
-        item['esp32_id'] = esp32_id
-        conexao['vinculo'] = (tipo, item_id)
-        conexao['fila_saida'].append(f"NOME:{item['nome'][:16]}")
-        if prova['ativa']:
-            conexao['fila_saida'].append(f"PROVA:{formatar_tempo(tempo_restante(prova))}")
+    with conexoes_lock:
+        conexoes[esp32_id] = {"fila_saida": list(resultado['comandos']), "ultimo_tick": time.time()}
     return jsonify({"ok": True})
 
 
 @app.route('/api/sala/<codigo>/desvincular', methods=['POST'])
 def api_desvincular(codigo):
-    sala = obter_sala(codigo)
-    if not sala:
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
         return jsonify({"ok": False}), 404
     dados = request.get_json(force=True) or {}
     tipo = dados.get('tipo')
-    item_id = str(dados.get('item_id', ''))
-    if tipo not in ('eliminatorias', 'final') or not item_id:
+    try:
+        item_id = int(dados.get('item_id'))
+    except (TypeError, ValueError):
         return jsonify({"ok": False}), 400
-    with sala['lock']:
-        item = sala['provas'][tipo]['itens'].get(item_id)
-        if item and item['esp32_id']:
-            conexao = sala['conexoes'].get(item['esp32_id'])
-            if conexao:
-                conexao['vinculo'] = None
-            item['esp32_id'] = None
+    if tipo not in ('eliminatorias', 'final'):
+        return jsonify({"ok": False}), 400
+    db.desvincular(codigo, tipo, item_id)
     return jsonify({"ok": True})
 
 
 @app.route('/api/sala/<codigo>/tick', methods=['POST'])
 def api_tick(codigo):
-    sala = obter_sala(codigo)
-    if not sala:
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
         return jsonify({"ok": False, "erro": "sala não encontrada"}), 404
     dados = request.get_json(force=True) or {}
     esp32_id = dados.get('esp32_id')
     tempo_str = dados.get('t', '')
     if not esp32_id:
         return jsonify({"ok": False}), 400
-    with sala['lock']:
-        conexao = obter_ou_criar_conexao(sala, esp32_id)
-        conexao['ultimo_tick'] = time.time()
-        if tempo_str and validar_tempo(tempo_str) and conexao['vinculo']:
-            tipo, item_id = conexao['vinculo']
-            prova = sala['provas'][tipo]
-            item = prova['itens'].get(item_id)
-            if item and prova['ativa']:
-                item['tempo_texto'] = tempo_str
-                item['tempo_segundos'] = tempo_para_segundos(tempo_str)
-        comandos = conexao['fila_saida']
-        conexao['fila_saida'] = []
+
+    tempo_valido = db.validar_tempo(tempo_str)
+    tempo_seg = db.tempo_para_segundos(tempo_str) if tempo_valido else 0.0
+    db.tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_seg)
+
+    with conexoes_lock:
+        c = conexoes.setdefault(esp32_id, {"fila_saida": [], "ultimo_tick": time.time()})
+        c["ultimo_tick"] = time.time()
+        comandos = c["fila_saida"]
+        c["fila_saida"] = []
     return jsonify({"ok": True, "comandos": comandos})
 
 
@@ -381,84 +245,55 @@ def api_tick(codigo):
 
 @app.route('/api/sala/<codigo>/ranking_geral')
 def api_ranking_geral(codigo):
-    """Resultado Geral = uma linha por pássaro que chegou na Final, mostrando
-    o tempo de cada fase, mas a COLOCAÇÃO é sempre pelo tempo da Final —
-    a Eliminatória é só classificatória, não compete com a Final (mesma
-    lógica do programa original)."""
-    sala = obter_sala(codigo)
-    if not sala:
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
         return jsonify({"ok": False}), 404
-    with sala['lock']:
-        elim_itens = sala['provas']['eliminatorias']['itens']
-        final_itens = sala['provas']['final']['itens']
-
-        # mapa auxiliar (nome, anilha) -> item da eliminatória, pra achar o
-        # tempo de eliminatória de pássaros que foram parar na final sem
-        # passar pelo botão "Classificar" (adicionados direto na Final)
-        por_nome_anilha = {(it['nome'], it.get('anilha', '')): it for it in elim_itens.values()}
-
-        linhas = []
-        for fitem in final_itens.values():
-            origem_id = fitem.get('origem_id')
-            elim_item = elim_itens.get(origem_id) if origem_id else None
-            if elim_item is None:
-                elim_item = por_nome_anilha.get((fitem['nome'], fitem.get('anilha', '')))
-
-            linhas.append({
-                "nome": fitem['nome'],
-                "anilha": fitem.get('anilha', ''),
-                "proprietario": fitem.get('proprietario', ''),
-                "tempo_eliminatoria_texto": elim_item['tempo_texto'] if elim_item else '-',
-                "tempo_final_texto": fitem['tempo_texto'],
-                "tempo_final_segundos": fitem['tempo_segundos'],
-            })
-
-        linhas.sort(key=lambda x: x['tempo_final_segundos'], reverse=True)
-        for i, r in enumerate(linhas, 1):
-            r['posicao'] = i
-    return jsonify({"ok": True, "ranking": linhas})
+    ranking = db.ranking_geral(codigo)
+    return jsonify({"ok": True, "ranking": ranking})
 
 
 # ════════════════════════════════════════════════════════════════════
-# LIMPEZA DE SALAS VELHAS (evita crescer memória pra sempre)
+# FINALIZAÇÃO AUTOMÁTICA + LIMPEZA (roda em segundo plano)
 # ════════════════════════════════════════════════════════════════════
-
-def _finalizar_prova_interno(sala, tipo):
-    """Mesma lógica do endpoint /finalizar, reaproveitada tanto pelo
-    organizador clicando quanto pelo relógio automático."""
-    prova = sala['provas'][tipo]
-    prova['ativa'] = False
-    prova['finalizada'] = True
-    for item in prova['itens'].values():
-        if item['esp32_id']:
-            empurrar_comando(sala, item['esp32_id'], "FINALIZAR")
-
 
 def _reaper():
     while True:
-        time.sleep(1)
+        time.sleep(2)
+        try:
+            for vencida in db.provas_para_finalizar_automaticamente():
+                for esp32_id in vencida['vinculados']:
+                    empurrar_comandos(esp32_id, ["FINALIZAR"])
+        except Exception as e:
+            print(f"⚠ erro no reaper (finalização automática): {e}")
+
+        try:
+            apagadas = db.apagar_salas_expiradas(horas=48)
+            if apagadas:
+                print(f"🧹 salas apagadas por expiração (48h): {apagadas}")
+        except Exception as e:
+            print(f"⚠ erro no reaper (limpeza de salas): {e}")
+
+        # limpa conexões efêmeras (fila de comandos) sem tick há muito tempo,
+        # só pra não crescer memória à toa — não afeta o vínculo no banco
         agora = time.time()
-        with salas_lock:
-            itens_salas = list(salas.items())
-        for codigo, sala in itens_salas:
-            with sala['lock']:
-                for tipo in ('eliminatorias', 'final'):
-                    prova = sala['provas'][tipo]
-                    if prova['ativa'] and tempo_restante(prova) <= 0:
-                        _finalizar_prova_interno(sala, tipo)
-        if int(agora) % 60 == 0:
-            with salas_lock:
-                expiradas = [c for c, s in salas.items() if agora - s['ultimo_uso'] > 12 * 3600]
-                for c in expiradas:
-                    del salas[c]
-
-
-threading.Thread(target=_reaper, daemon=True).start()
+        with conexoes_lock:
+            mortas = [eid for eid, c in conexoes.items() if agora - c['ultimo_tick'] > 3600]
+            for eid in mortas:
+                del conexoes[eid]
 
 
 # ════════════════════════════════════════════════════════════════════
-# TELAS (HTML embutido — sem build, sem framework de frontend)
+# INICIALIZAÇÃO
 # ════════════════════════════════════════════════════════════════════
+
+try:
+    db.inicializar_schema()
+    threading.Thread(target=_reaper, daemon=True).start()
+    print("✅ Banco de dados conectado e schema verificado.")
+except Exception as e:
+    print(f"⚠ AVISO: não consegui conectar/inicializar o banco de dados agora: {e}")
+    print("   Defina a variável de ambiente DATABASE_URL com a connection string do Neon.")
+
 
 ESTILO_BASE = """
 * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
@@ -500,13 +335,13 @@ HTML_HOME = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Marcador Digital - Web</title>
+<title>Marcador Digital Goularth - Web</title>
 <style>""" + ESTILO_BASE + """</style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🐦 Marcador Digital</h1>
-  <div class="sub">Cronômetro de provas — versão web</div>
+  <h1>🐦 Marcador Digital Goularth</h1>
+  <div class="sub">versão web — cronômetro de provas</div>
 
   <div class="card">
     <h2 style="margin-top:0">Criar uma sala nova</h2>
@@ -561,7 +396,7 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Marcador Digital - Organizador</title>
+<title>Marcador Digital Goularth - Organizador</title>
 <style>""" + ESTILO_BASE + """
 .faixa-codigo { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
 .relogio { text-align:center; margin:6px 0 16px; }
@@ -577,7 +412,7 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <div class="wrap">
   <div class="faixa-codigo">
     <div>
-      <h1 style="margin-bottom:2px">🐦 Marcador Digital</h1>
+      <h1 style="margin-bottom:2px">🐦 Marcador Digital Goularth</h1>
       <div class="sub">sala <span class="codigo-sala" id="codigoTopo">------</span></div>
     </div>
     <button class="btn-roxo" onclick="copiarLinkCelular()">📟 Link do celular</button>
@@ -647,8 +482,12 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
       <thead><tr><th>#</th><th>Pássaro</th><th>Anilha</th><th>Proprietário</th><th>Eliminatória</th><th>Final</th></tr></thead>
       <tbody></tbody>
     </table>
+    <div class="linha-botoes">
+      <button class="btn-ouro" onclick="gerarImagemResultado()" style="width:100%">🖼️ Gerar imagem pra compartilhar</button>
+    </div>
   </div>
 </div>
+<canvas id="canvasResultado" style="display:none"></canvas>
 
 <script>
 const codigo = location.pathname.split('/').pop().toUpperCase();
@@ -904,6 +743,106 @@ function renderGeral() {
       <td style="font-family:monospace">${r.tempo_final_texto}</td>`;
     tbody.appendChild(tr);
   });
+}
+
+// ═══════ GERAR IMAGEM DO RESULTADO (leve, fácil de compartilhar no
+// WhatsApp/etc.) — desenhada direto no navegador com <canvas>, não
+// depende do servidor pra nada, então funciona até se a sala tiver
+// caído: usa os dados que já estão salvos aqui no navegador. ═══════
+function gerarImagemResultado() {
+  const lista = carregarResultadosLocais();
+  if (lista.length === 0) { alert('Ainda não tem resultado de Final pra gerar imagem.'); return; }
+
+  const linhaAltura = 34;
+  const cabecalhoAltura = 108;
+  const rodapeAltura = 30;
+  const largura = 720;
+  const altura = cabecalhoAltura + (lista.length + 1) * linhaAltura + rodapeAltura;
+
+  const canvas = document.getElementById('canvasResultado');
+  canvas.width = largura;
+  canvas.height = altura;
+  const ctx = canvas.getContext('2d');
+
+  // fundo
+  ctx.fillStyle = '#0B1629';
+  ctx.fillRect(0, 0, largura, altura);
+
+  // cabeçalho
+  ctx.fillStyle = '#F0C030';
+  ctx.font = 'bold 24px Arial';
+  ctx.fillText('🐦 Marcador Digital Goularth', 20, 38);
+  ctx.fillStyle = '#93a4c3';
+  ctx.font = '13px Arial';
+  ctx.fillText('Resultado Geral — sala ' + codigo, 20, 60);
+  ctx.fillText('Colocação pelo tempo da Final', 20, 78);
+
+  // colunas
+  const colunas = [
+    { titulo: '#',            x: 20,  largura: 34 },
+    { titulo: 'Pássaro',      x: 56,  largura: 150 },
+    { titulo: 'Anilha',       x: 210, largura: 90 },
+    { titulo: 'Proprietário', x: 304, largura: 150 },
+    { titulo: 'Eliminatória', x: 458, largura: 110 },
+    { titulo: 'Final',        x: 572, largura: 120 },
+  ];
+
+  let y = cabecalhoAltura;
+
+  // cabeçalho da tabela
+  ctx.fillStyle = '#16213d';
+  ctx.fillRect(16, y - 22, largura - 32, linhaAltura);
+  ctx.fillStyle = '#F0C030';
+  ctx.font = 'bold 13px Arial';
+  colunas.forEach(c => ctx.fillText(c.titulo, c.x, y));
+  y += linhaAltura;
+
+  ctx.font = '13px Arial';
+  lista.forEach((r, i) => {
+    if (i % 2 === 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      ctx.fillRect(16, y - 22, largura - 32, linhaAltura);
+    }
+    ctx.fillStyle = r.posicao <= 3 ? '#F0C030' : '#EAF1FF';
+    ctx.fillText(r.posicao + 'º', colunas[0].x, y);
+    ctx.fillStyle = '#EAF1FF';
+    ctx.fillText(truncarTexto(ctx, r.nome, colunas[1].largura), colunas[1].x, y);
+    ctx.fillText(truncarTexto(ctx, r.anilha || '-', colunas[2].largura), colunas[2].x, y);
+    ctx.fillText(truncarTexto(ctx, r.proprietario || '-', colunas[3].largura), colunas[3].x, y);
+    ctx.fillStyle = '#93a4c3';
+    ctx.fillText(r.tempo_eliminatoria_texto, colunas[4].x, y);
+    ctx.fillStyle = '#3ddc84';
+    ctx.font = 'bold 13px Arial';
+    ctx.fillText(r.tempo_final_texto, colunas[5].x, y);
+    ctx.font = '13px Arial';
+    y += linhaAltura;
+  });
+
+  ctx.fillStyle = '#5a6d94';
+  ctx.font = '11px Arial';
+  ctx.fillText('gerado em ' + new Date().toLocaleString('pt-BR'), 20, altura - 10);
+
+  canvas.toBlob(async (blob) => {
+    const arquivo = new File([blob], `resultado_${codigo}.png`, { type: 'image/png' });
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [arquivo] })) {
+      try {
+        await navigator.share({ files: [arquivo], title: 'Resultado Geral - ' + codigo });
+        return;
+      } catch (e) { /* usuário cancelou o compartilhamento, cai pro download */ }
+    }
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `resultado_${codigo}.png`;
+    link.click();
+  }, 'image/png');
+}
+
+function truncarTexto(ctx, texto, larguraMax) {
+  texto = texto || '';
+  while (ctx.measureText(texto).width > larguraMax - 10 && texto.length > 0) {
+    texto = texto.slice(0, -1);
+  }
+  return texto;
 }
 
 // ═══════ SINCRONIZAÇÃO DE FUNDO (mantém o arquivo local sempre atualizado,
