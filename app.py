@@ -11,10 +11,7 @@ import db
 app = Flask(__name__)
 
 # ════════════════════════════════════════════════════════════════════
-# ESTADO EFÊMERO (só isso continua em memória — não precisa sobreviver
-# a reinício do servidor, porque o vínculo em si já está salvo no
-# banco). São só os comandos "pendentes de entrega" pro celular
-# (NOME:/PROVA:/RESET/FINALIZAR) até a próxima vez que ele der um tick.
+# ESTADO EFÊMERO (só isso continua em memória)
 # ════════════════════════════════════════════════════════════════════
 
 conexoes_lock = threading.Lock()
@@ -38,6 +35,67 @@ def novo_codigo_sala():
 
 
 # ════════════════════════════════════════════════════════════════════
+# API — ADMIN
+# ════════════════════════════════════════════════════════════════════
+
+@app.route('/api/admin/estatisticas')
+def api_admin_estatisticas():
+    """Retorna estatísticas do sistema."""
+    senha = request.headers.get('X-Admin-Password', '')
+    if not db.verificar_senha_admin(senha):
+        return jsonify({"ok": False, "erro": "senha inválida"}), 401
+    
+    stats = db.obter_estatisticas()
+    stats['ok'] = True
+    return jsonify(stats)
+
+
+@app.route('/api/admin/logs')
+def api_admin_logs():
+    """Retorna os logs mais recentes."""
+    senha = request.headers.get('X-Admin-Password', '')
+    if not db.verificar_senha_admin(senha):
+        return jsonify({"ok": False, "erro": "senha inválida"}), 401
+    
+    limite = request.args.get('limite', 50, type=int)
+    logs = db.obter_logs_recentes(limite)
+    return jsonify({"ok": True, "logs": logs})
+
+
+@app.route('/api/admin/imagem', methods=['GET', 'POST'])
+def api_admin_imagem():
+    """Obtém ou atualiza a imagem do botão."""
+    if request.method == 'GET':
+        imagem = db.obter_imagem_botao()
+        return jsonify({"ok": True, "imagem": imagem})
+    
+    # POST - atualizar imagem
+    senha = request.headers.get('X-Admin-Password', '')
+    if not db.verificar_senha_admin(senha):
+        return jsonify({"ok": False, "erro": "senha inválida"}), 401
+    
+    dados = request.get_json(force=True) or {}
+    imagem = dados.get('imagem', '')
+    db.definir_config_admin("imagem_botao", imagem)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/admin/senha', methods=['POST'])
+def api_admin_alterar_senha():
+    """Altera a senha do admin."""
+    dados = request.get_json(force=True) or {}
+    senha_antiga = dados.get('senha_antiga', '')
+    senha_nova = dados.get('senha_nova', '')
+    
+    if not senha_nova or len(senha_nova) < 4:
+        return jsonify({"ok": False, "erro": "senha nova deve ter pelo menos 4 caracteres"}), 400
+    
+    if db.alterar_senha_admin(senha_antiga, senha_nova):
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "erro": "senha antiga incorreta"}), 401
+
+
+# ════════════════════════════════════════════════════════════════════
 # API — SALA
 # ════════════════════════════════════════════════════════════════════
 
@@ -45,12 +103,17 @@ def novo_codigo_sala():
 def api_criar_sala():
     codigo = novo_codigo_sala()
     db.criar_sala(codigo)
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True, "codigo": codigo})
 
 
 @app.route('/api/sala/<codigo>/existe')
 def api_sala_existe(codigo):
-    return jsonify({"ok": True, "existe": db.sala_existe(codigo.upper())})
+    codigo = codigo.upper()
+    existe = db.sala_existe(codigo)
+    if existe:
+        db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
+    return jsonify({"ok": True, "existe": existe})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -68,6 +131,7 @@ def api_cadastrar_prova(codigo):
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False, "erro": "tipo inválido"}), 400
     db.cadastrar_prova(codigo, tipo, passaros)
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -96,6 +160,7 @@ def api_ver_prova(codigo, tipo):
         }
         for it in resultado['itens']
     ]
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({
         "ok": True,
         "ativa": prova['ativa'],
@@ -117,6 +182,7 @@ def api_iniciar_prova(codigo, tipo):
     restante_txt = db.formatar_tempo(resultado['duracao'])
     for esp32_id in resultado['vinculados']:
         empurrar_comandos(esp32_id, [f"PROVA:{restante_txt}"])
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -128,6 +194,7 @@ def api_finalizar_prova(codigo, tipo):
     vinculados = db.finalizar_prova(codigo, tipo)
     for esp32_id in vinculados:
         empurrar_comandos(esp32_id, ["FINALIZAR"])
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -139,6 +206,7 @@ def api_limpar_prova(codigo, tipo):
     vinculados = db.limpar_prova(codigo, tipo)
     for esp32_id in vinculados:
         empurrar_comandos(esp32_id, ["RESET"])
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -158,6 +226,7 @@ def api_classificar(codigo):
         qtd = db.obter_quantidade_classificados(codigo)
     qtd = max(0, qtd)
     total = db.classificar(codigo, qtd)
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True, "classificados": total})
 
 
@@ -171,6 +240,7 @@ def api_passaros_livres(codigo, tipo):
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
     itens = db.passaros_livres(codigo, tipo)
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True, "itens": [{"id": it['id'], "nome": it['nome']} for it in itens]})
 
 
@@ -196,6 +266,8 @@ def api_vincular(codigo):
 
     with conexoes_lock:
         conexoes[esp32_id] = {"fila_saida": list(resultado['comandos']), "ultimo_tick": time.time()}
+    
+    db.registrar_acesso(codigo, 'api', esp32_id=esp32_id, ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -213,6 +285,7 @@ def api_desvincular(codigo):
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 400
     db.desvincular(codigo, tipo, item_id)
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -236,6 +309,8 @@ def api_tick(codigo):
         c["ultimo_tick"] = time.time()
         comandos = c["fila_saida"]
         c["fila_saida"] = []
+    
+    db.registrar_acesso(codigo, 'api', esp32_id=esp32_id, ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True, "comandos": comandos})
 
 
@@ -249,6 +324,7 @@ def api_ranking_geral(codigo):
     if not db.sala_existe(codigo):
         return jsonify({"ok": False}), 404
     ranking = db.ranking_geral(codigo)
+    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True, "ranking": ranking})
 
 
@@ -273,8 +349,7 @@ def _reaper():
         except Exception as e:
             print(f"⚠ erro no reaper (limpeza de salas): {e}")
 
-        # limpa conexões efêmeras (fila de comandos) sem tick há muito tempo,
-        # só pra não crescer memória à toa — não afeta o vínculo no banco
+        # limpa conexões efêmeras sem tick há muito tempo
         agora = time.time()
         with conexoes_lock:
             mortas = [eid for eid, c in conexoes.items() if agora - c['ultimo_tick'] > 3600]
@@ -295,6 +370,10 @@ except Exception as e:
     print("   Defina a variável de ambiente DATABASE_URL com a connection string do Neon.")
 
 
+# ════════════════════════════════════════════════════════════════════
+# ESTILO BASE (compartilhado entre todas as telas)
+# ════════════════════════════════════════════════════════════════════
+
 ESTILO_BASE = """
 * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
 body { background:#0B1629; font-family:'Trebuchet MS', Arial, sans-serif; color:#EAF1FF; min-height:100vh; }
@@ -304,7 +383,7 @@ h1 { color:#F0C030; font-size:20px; margin-bottom:4px; }
 h2 { color:#F0C030; font-size:15px; margin:16px 0 8px; }
 .sub { color:#93a4c3; font-size:12px; margin-bottom:14px; }
 .card { background:#16213d; border-radius:12px; padding:16px; margin-bottom:12px; border-left:4px solid #C9980E; }
-input[type=text], input[type=number] {
+input[type=text], input[type=number], input[type=password] {
   width:100%; padding:12px; border-radius:8px; border:1px solid #2a3a63; background:#0f1830;
   color:#EAF1FF; font-size:15px; margin-bottom:8px;
 }
@@ -327,8 +406,16 @@ th { color:#93a4c3; font-weight:normal; }
 .tab-btn.ativa { background:#F0C030; color:#0B1629; }
 .vazio { text-align:center; color:#5a6d94; padding:14px; font-size:13px; }
 .codigo-sala { font-family:monospace; font-size:22px; letter-spacing:3px; color:#F0C030; font-weight:bold; }
+.estatistica-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-top:10px; }
+.estatistica-item { background:#0f1830; border-radius:8px; padding:12px; text-align:center; }
+.estatistica-item .valor { font-size:28px; font-weight:bold; color:#F0C030; }
+.estatistica-item .label { font-size:11px; color:#93a4c3; margin-top:4px; }
 """
 
+
+# ════════════════════════════════════════════════════════════════════
+# TELA HOME
+# ════════════════════════════════════════════════════════════════════
 
 HTML_HOME = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -356,6 +443,10 @@ HTML_HOME = """<!DOCTYPE html>
       <button class="btn-azul" onclick="entrarComoOrganizador()">🧑‍💻 Entrar como organizador</button>
       <button class="btn-roxo" onclick="entrarComoCelular()">📟 Entrar como celular-ESP32</button>
     </div>
+  </div>
+  
+  <div style="text-align:center; margin-top:20px;">
+    <a href="/admin" style="color:#5a6d94; font-size:12px; text-decoration:none;">⚙️ Admin</a>
   </div>
 </div>
 <script>
@@ -390,6 +481,10 @@ function entrarComoCelular() {
 def tela_home():
     return HTML_HOME
 
+
+# ════════════════════════════════════════════════════════════════════
+# TELA ORGANIZADOR
+# ════════════════════════════════════════════════════════════════════
 
 HTML_ORGANIZADOR = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -449,12 +544,12 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ═══════ ELIMINATÓRIA / FINAL (mesma estrutura, tipo trocado por JS) ═══════ -->
+  <!-- ═══════ ELIMINATÓRIA / FINAL ═══════ -->
   <div id="telaProva" class="card" style="display:none">
     <h2 style="margin-top:0" id="tituloProva">Eliminatória</h2>
 
     <div class="relogio" id="blocoRelogio" style="display:none">
-      <div class="relogio-numero" id="relogioNumero">00:00</div>
+      <div class="relogio-numero" id="relogioNumero">00:00:000</div>
       <div class="relogio-legenda" id="relogioLegenda">tempo restante da prova</div>
     </div>
 
@@ -508,9 +603,6 @@ function salvarCadastro(lista) {
   localStorage.setItem(CHAVE_CADASTRO, JSON.stringify(lista));
 }
 
-// ═══════ ARQUIVO LOCAL DE RESULTADOS (sobrevive a reinício do servidor) ═══════
-// Guarda direto a lista já pronta que vem do /ranking_geral (uma linha por
-// pássaro da Final, com o tempo da Eliminatória e o tempo da Final juntos).
 function carregarResultadosLocais() {
   try { return JSON.parse(localStorage.getItem(CHAVE_RESULTADOS)) || []; }
   catch (e) { return []; }
@@ -529,7 +621,15 @@ function copiarLinkCelular() {
   alert('Link copiado:\\n' + link + '\\n\\nManda pra quem vai usar o celular como marcador.');
 }
 
-// ═══════ NAVEGAÇÃO ENTRE TELAS ═══════
+function formatarMMSSmmm(segundos) {
+  segundos = Math.max(0, segundos);
+  const mm = String(Math.floor(segundos / 60)).padStart(2, '0');
+  const ss = String(Math.floor(segundos % 60)).padStart(2, '0');
+  const mmm = String(Math.floor((segundos - Math.floor(segundos)) * 1000)).padStart(3, '0');
+  return `${mm}:${ss}:${mmm}`;
+}
+
+// ═══════ NAVEGAÇÃO ═══════
 function mostrarTela(nome) {
   telaAtual = nome;
   document.getElementById('telaCadastro').style.display = nome === 'cadastro' ? 'block' : 'none';
@@ -635,14 +735,7 @@ async function adicionarTodosAProva() {
   }
 }
 
-// ═══════ PROVA (Eliminatória / Final) ═══════
-function formatarMMSS(segundos) {
-  segundos = Math.max(0, Math.round(segundos));
-  const mm = String(Math.floor(segundos / 60)).padStart(2, '0');
-  const ss = String(segundos % 60).padStart(2, '0');
-  return `${mm}:${ss}`;
-}
-
+// ═══════ PROVA ═══════
 async function atualizarProva() {
   if (telaAtual !== 'eliminatorias' && telaAtual !== 'final') return;
   try {
@@ -658,12 +751,12 @@ async function atualizarProva() {
     if (data.ativa) {
       blocoRelogio.style.display = 'block';
       blocoRelogio.classList.toggle('acabando', data.tempo_restante <= 30);
-      document.getElementById('relogioNumero').textContent = formatarMMSS(data.tempo_restante);
+      document.getElementById('relogioNumero').textContent = formatarMMSSmmm(data.tempo_restante);
       document.getElementById('relogioLegenda').textContent = 'tempo restante da prova (finaliza sozinho)';
     } else if (data.finalizada) {
       blocoRelogio.style.display = 'block';
       blocoRelogio.classList.remove('acabando');
-      document.getElementById('relogioNumero').textContent = '00:00';
+      document.getElementById('relogioNumero').textContent = '00:00:000';
       document.getElementById('relogioLegenda').textContent = 'prova finalizada';
     } else {
       blocoRelogio.style.display = 'none';
@@ -725,9 +818,7 @@ async function classificarParaFinal() {
   }
 }
 
-// ═══════ RESULTADO GERAL (lê do arquivo local — sobrevive a reinício do
-// servidor). Uma linha por pássaro da Final; a colocação é sempre pelo
-// tempo da Final — a Eliminatória só aparece como referência ao lado. ═══════
+// ═══════ RESULTADO GERAL ═══════
 function renderGeral() {
   const lista = carregarResultadosLocais();
   const tbody = document.querySelector('#tabelaGeral tbody');
@@ -745,10 +836,7 @@ function renderGeral() {
   });
 }
 
-// ═══════ GERAR IMAGEM DO RESULTADO (leve, fácil de compartilhar no
-// WhatsApp/etc.) — desenhada direto no navegador com <canvas>, não
-// depende do servidor pra nada, então funciona até se a sala tiver
-// caído: usa os dados que já estão salvos aqui no navegador. ═══════
+// ═══════ GERAR IMAGEM ═══════
 function gerarImagemResultado() {
   const lista = carregarResultadosLocais();
   if (lista.length === 0) { alert('Ainda não tem resultado de Final pra gerar imagem.'); return; }
@@ -764,11 +852,9 @@ function gerarImagemResultado() {
   canvas.height = altura;
   const ctx = canvas.getContext('2d');
 
-  // fundo
   ctx.fillStyle = '#0B1629';
   ctx.fillRect(0, 0, largura, altura);
 
-  // cabeçalho
   ctx.fillStyle = '#F0C030';
   ctx.font = 'bold 24px Arial';
   ctx.fillText('🐦 Marcador Digital Goularth', 20, 38);
@@ -777,7 +863,6 @@ function gerarImagemResultado() {
   ctx.fillText('Resultado Geral — sala ' + codigo, 20, 60);
   ctx.fillText('Colocação pelo tempo da Final', 20, 78);
 
-  // colunas
   const colunas = [
     { titulo: '#',            x: 20,  largura: 34 },
     { titulo: 'Pássaro',      x: 56,  largura: 150 },
@@ -789,7 +874,6 @@ function gerarImagemResultado() {
 
   let y = cabecalhoAltura;
 
-  // cabeçalho da tabela
   ctx.fillStyle = '#16213d';
   ctx.fillRect(16, y - 22, largura - 32, linhaAltura);
   ctx.fillStyle = '#F0C030';
@@ -828,7 +912,7 @@ function gerarImagemResultado() {
       try {
         await navigator.share({ files: [arquivo], title: 'Resultado Geral - ' + codigo });
         return;
-      } catch (e) { /* usuário cancelou o compartilhamento, cai pro download */ }
+      } catch (e) { /* cancelado */ }
     }
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
@@ -845,14 +929,13 @@ function truncarTexto(ctx, texto, larguraMax) {
   return texto;
 }
 
-// ═══════ SINCRONIZAÇÃO DE FUNDO (mantém o arquivo local sempre atualizado,
-// mesmo que o organizador esteja numa aba diferente) ═══════
+// ═══════ SINCRONIZAÇÃO ═══════
 async function sincronizarFundo() {
   try {
     const resp = await fetch(`/api/sala/${codigo}/ranking_geral`);
     const data = await resp.json();
     if (data.ok) salvarResultadosLocais(data.ranking);
-  } catch (e) { /* servidor fora do ar — o que já tem continua salvo */ }
+  } catch (e) { /* servidor fora do ar */ }
   if (telaAtual === 'geral') renderGeral();
 }
 
@@ -869,8 +952,14 @@ mostrarTela('cadastro');
 
 @app.route('/organizador/<codigo>')
 def tela_organizador(codigo):
+    codigo = codigo.upper()
+    db.registrar_acesso(codigo, 'organizador', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return HTML_ORGANIZADOR
 
+
+# ════════════════════════════════════════════════════════════════════
+# TELA CELULAR (VERSÃO MELHORADA - COMPLETA)
+# ════════════════════════════════════════════════════════════════════
 
 HTML_CELULAR = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -879,26 +968,67 @@ HTML_CELULAR = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 <title>Celular como ESP32</title>
 <style>""" + ESTILO_BASE + """
-  body { user-select:none; }
+  body { user-select:none; background:#0a0f1f; }
+  .status-bar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:4px; }
+  .device-id { font-size:11px; color:#5a6d94; font-family:monospace; background:#0f1830; padding:4px 10px; border-radius:6px; border:1px solid #1a2a4a; }
   .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:14px 0 8px; }
-  .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444; }
-  .bolinha.ok { background:#10b981; }
-  .lcd { background:#000; border-radius:14px; padding:18px 12px; margin-bottom:22px; border:3px solid #223; }
-  .lcd-linha0 { color:#F0C030; font-family:monospace; font-size:20px; text-align:center;
-                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:34px; text-align:center; margin-top:6px; letter-spacing:1px; }
-  .botao-canto { width:100%; padding:60px 0; border-radius:24px; border:none; font-weight:bold; font-size:20px;
-                 color:white; background:#1558B0; box-shadow:0 4px 0 #0d3a7c; touch-action:none; }
-  .botao-canto.pressionado { background:#177A38; box-shadow:0 2px 0 #0d3a7c; transform:translateY(2px); }
-  .botao-canto:disabled { background:#374158; box-shadow:0 4px 0 #232a3a; color:#7c88a6; }
+  .bolinha { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; background:#ef4444; transition:0.3s; }
+  .bolinha.ok { background:#10b981; box-shadow:0 0 10px #10b98166; }
+  .lcd { background:linear-gradient(145deg, #0a0a1a, #1a1a2e); border-radius:16px; padding:20px 16px; 
+         margin-bottom:22px; border:2px solid #2a3a63; box-shadow:inset 0 0 30px rgba(0,0,0,0.8), 0 4px 20px rgba(0,0,0,0.4); }
+  .lcd-linha0 { color:#F0C030; font-family:monospace; font-size:18px; text-align:center;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-height:24px; text-shadow:0 0 10px rgba(240,192,48,0.2); }
+  .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:38px; text-align:center; 
+                margin-top:4px; letter-spacing:2px; text-shadow:0 0 20px #3ddc8444; font-weight:bold; }
+  .botao-canto { 
+    width:100%; padding:0; border-radius:24px; border:none; background:#1a2a4a; 
+    box-shadow:0 6px 0 #0d1a30, 0 8px 20px rgba(0,0,0,0.5); 
+    touch-action:none; overflow:hidden; position:relative; transition:all 0.05s;
+    cursor:pointer;
+  }
+  .botao-canto img { 
+    width:100%; height:auto; display:block; border-radius:24px;
+    transition:filter 0.2s;
+  }
+  .botao-canto.pressionado { transform:scale(0.97); box-shadow:0 2px 0 #0d1a30; }
+  .botao-canto:disabled { opacity:0.5; transform:none; box-shadow:0 6px 0 #0d1a30; cursor:default; }
+  .botao-canto:disabled img { filter:grayscale(0.8); }
+  .botao-canto .overlay-text {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    font-weight:bold; font-size:22px; color:white; text-shadow:0 2px 10px rgba(0,0,0,0.9);
+    pointer-events:none; background:rgba(0,0,0,0.2);
+  }
+  .botao-canto.pressionado .overlay-text { background:rgba(0,80,30,0.3); color:#3ddc84; }
+  .passaro-card { 
+    padding:16px; margin:6px 0; background:#16213d; border-radius:10px; 
+    cursor:pointer; transition:all 0.2s; border-left:3px solid #C9980E;
+    font-size:15px; font-weight:500;
+  }
+  .passaro-card:active { transform:scale(0.97); background:#1a2a5a; }
+  .passaro-card .sub-info { font-size:11px; color:#93a4c3; font-weight:normal; }
+  .vinculado-atual { 
+    background:linear-gradient(145deg, #0f1830, #16213d); border-radius:10px; padding:10px 14px; margin:8px 0 14px;
+    border:1px solid #2a3a63; color:#93a4c3; font-size:13px; text-align:center;
+  }
+  .vinculado-atual strong { color:#F0C030; }
+  .btn-trocar { background:#6025A8; color:white; padding:12px; border-radius:10px; border:none; font-weight:bold; width:100%; margin-top:8px; cursor:pointer; }
+  .btn-trocar:active { transform:scale(0.97); }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>📟 Celular como ESP32</h1>
-  <div class="sub">sala <span class="codigo-sala" id="codigoTopo" style="font-size:15px;">------</span></div>
-  <div class="sub"><span class="bolinha" id="bolinhaStatus"></span><span id="textoStatus">conectando...</span></div>
+  <div class="status-bar">
+    <div>
+      <h1 style="margin-bottom:2px">📟 ESP32 Virtual</h1>
+      <div class="sub" style="margin-bottom:0;">sala <span class="codigo-sala" id="codigoTopo" style="font-size:16px;">------</span></div>
+    </div>
+    <span class="device-id" id="deviceIdDisplay">---</span>
+  </div>
+  <div class="sub" style="margin-top:2px;">
+    <span class="bolinha" id="bolinhaStatus"></span><span id="textoStatus">conectando...</span>
+  </div>
 
+  <!-- TELA DE VINCULAR -->
   <div id="telaVincular">
     <div class="cat-titulo">🔵 ELIMINATÓRIA</div>
     <div id="listaElim"><div class="vazio">carregando...</div></div>
@@ -906,21 +1036,23 @@ HTML_CELULAR = """<!DOCTYPE html>
     <div id="listaFinal"><div class="vazio">carregando...</div></div>
   </div>
 
-  <div id="telaMarcador" style="display:none">
+  <!-- TELA DO MARCADOR -->
+  <div id="telaMarcador" style="display:none;">
+    <div class="vinculado-atual">
+      📌 Vinculado: <strong id="nomeVinculado">-</strong>
+    </div>
     <div class="lcd">
       <div class="lcd-linha0" id="lcdLinha0">-</div>
       <div class="lcd-linha1" id="lcdLinha1">00:00:000</div>
     </div>
-    <button class="botao-canto" id="botaoCanto">AGUARDANDO INÍCIO DA PROVA</button>
-    <div class="linha-botoes">
-      <button class="btn-roxo" onclick="trocarPassaro()" style="width:100%">🔄 Trocar pássaro vinculado</button>
-    </div>
+    <button class="botao-canto" id="botaoCanto">
+      <img id="imgBotao" src="" alt="Botão" style="display:none;">
+      <div class="overlay-text" id="overlayText">AGUARDANDO</div>
+    </button>
+    <button class="btn-trocar" onclick="trocarPassaro()">🔄 Trocar pássaro vinculado</button>
   </div>
 </div>
 
-<!-- vídeo mudo de 1x1, só pra impedir a tela de apagar em navegadores que não
-     têm a Screen Wake Lock API (recebe uma "gravação" ao vivo de um canvas
-     parado, gerada na hora — não precisa de nenhum arquivo de vídeo) -->
 <video id="videoNoSleep" muted playsinline loop
        style="position:fixed; top:0; left:0; width:1px; height:1px; opacity:0.01; pointer-events:none;"></video>
 
@@ -930,14 +1062,14 @@ document.getElementById('codigoTopo').textContent = codigo;
 
 let deviceId = localStorage.getItem('celular_esp32_id');
 if (!deviceId) {
-  deviceId = 'CELULAR-' + Math.random().toString(36).slice(2,8).toUpperCase();
+  deviceId = 'CEL-' + Math.random().toString(36).slice(2,8).toUpperCase();
   localStorage.setItem('celular_esp32_id', deviceId);
 }
+document.getElementById('deviceIdDisplay').textContent = deviceId;
 
-let passaroAtual = null;    // {tipo, item_id}
+let passaroAtual = null;
 let conectado = false;
-
-let faseAtual = 0;          // 0=NOME 1=PROVA 2=FINALIZADO (sem ADAPT na fibra)
+let faseAtual = 0;
 let botaoBloqueado = true;
 let provaIniciada = false;
 let isRunning = false;
@@ -954,15 +1086,13 @@ function formatarTempo(msTotal) {
   const totalSeg = Math.floor(msTotal / 1000);
   const seg = totalSeg % 60;
   const min = Math.floor(totalSeg / 60);
-  const p2 = n => String(n).padStart(2, '0');
-  const p3 = n => String(n).padStart(3, '0');
-  return `${p2(min)}:${p2(seg)}:${p3(ms)}`;
+  return `${String(min).padStart(2,'0')}:${String(seg).padStart(2,'0')}:${String(ms).padStart(3,'0')}`;
 }
 
 function atualizarStatusConexao() {
   document.getElementById('bolinhaStatus').classList.toggle('ok', conectado);
   document.getElementById('textoStatus').textContent = conectado
-    ? ('conectado como ' + deviceId) : 'sem conexão — tentando de novo...';
+    ? 'conectado' : 'sem conexão — tentando...';
 }
 
 async function enviarTick(tempoStr) {
@@ -989,21 +1119,19 @@ function processarComando(msg) {
     totalTime = 0; startTime = 0; isRunning = false; provaIniciada = false;
     document.getElementById('lcdLinha0').textContent = nomePassaroAtual;
     document.getElementById('lcdLinha1').textContent = '00:00:000';
-
+    document.getElementById('nomeVinculado').textContent = nomePassaroAtual;
   } else if (msg.startsWith('PROVA:')) {
     syncTempoRestanteMs = parseTempoParaMs(msg.substring(6));
     syncRecebidoEm = Date.now();
     syncAtiva = true; faseAtual = 1; botaoBloqueado = false;
-
   } else if (/^reset$/i.test(msg)) {
     totalTime = 0; startTime = 0; isRunning = false; provaIniciada = false;
     botaoBloqueado = true; faseAtual = 0; syncAtiva = false;
     document.getElementById('lcdLinha0').textContent = nomePassaroAtual || deviceId;
     document.getElementById('lcdLinha1').textContent = '00:00:000';
-
   } else if (/^finalizar$/i.test(msg)) {
     isRunning = false; botaoBloqueado = true; faseAtual = 2; syncAtiva = false;
-    document.getElementById('lcdLinha0').textContent = 'PROVA FINALIZADA';
+    document.getElementById('lcdLinha0').textContent = '🏁 PROVA FINALIZADA';
     document.getElementById('lcdLinha1').textContent = 'FINALIZADA';
   }
   atualizarBotao();
@@ -1012,17 +1140,36 @@ function processarComando(msg) {
 function parseTempoParaMs(str) {
   const partes = str.split(':');
   if (partes.length !== 3) return 0;
-  const mm = parseInt(partes[0], 10) || 0;
-  const ss = parseInt(partes[1], 10) || 0;
-  const mmm = parseInt(partes[2], 10) || 0;
-  return mm * 60000 + ss * 1000 + mmm;
+  return (parseInt(partes[0])||0) * 60000 + (parseInt(partes[1])||0) * 1000 + (parseInt(partes[2])||0);
 }
 
 function atualizarBotao() {
   const btn = document.getElementById('botaoCanto');
+  const overlay = document.getElementById('overlayText');
   btn.disabled = botaoBloqueado;
-  btn.textContent = botaoBloqueado ? 'AGUARDANDO INÍCIO DA PROVA' : 'SEGURE PARA CANTAR';
+  if (faseAtual === 2) {
+    overlay.textContent = '🏁 FINALIZADA';
+  } else if (botaoBloqueado) {
+    overlay.textContent = '⏳ AGUARDANDO';
+  } else {
+    overlay.textContent = '🔴 SEGURE PARA CANTAR';
+  }
 }
+
+// Carregar imagem do botão
+async function carregarImagemBotao() {
+  try {
+    const resp = await fetch('/api/admin/imagem');
+    const data = await resp.json();
+    if (data.ok && data.imagem) {
+      const img = document.getElementById('imgBotao');
+      img.src = data.imagem;
+      img.style.display = 'block';
+      img.onerror = () => { img.style.display = 'none'; };
+    }
+  } catch (e) {}
+}
+carregarImagemBotao();
 
 const botaoEl = document.getElementById('botaoCanto');
 function iniciarCanto(ev) {
@@ -1054,7 +1201,7 @@ setInterval(() => {
     const decorrido = Date.now() - syncRecebidoEm;
     let restante = syncTempoRestanteMs - decorrido;
     if (restante < 0) restante = 0;
-    document.getElementById('lcdLinha0').textContent = 'PROVA ' + formatarTempo(restante);
+    document.getElementById('lcdLinha0').textContent = '⏱️ ' + formatarTempo(restante);
   }
 
   if (!tickEmAndamento) {
@@ -1082,12 +1229,11 @@ function montarLista(elId, itens, tipo) {
   }
   el.innerHTML = '';
   itens.forEach(p => {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.style.cursor = 'pointer';
-    card.textContent = p.nome;
-    card.onclick = () => vincularPassaro(tipo, p.id);
-    el.appendChild(card);
+    const div = document.createElement('div');
+    div.className = 'passaro-card';
+    div.innerHTML = `${p.nome} <span class="sub-info">(clique para vincular)</span>`;
+    div.onclick = () => vincularPassaro(tipo, p.id);
+    el.appendChild(div);
   });
 }
 
@@ -1135,10 +1281,6 @@ async function pedirWakeLock() {
   try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
 }
 
-// Fallback pra navegadores que não suportam a Screen Wake Lock API (ex.: iOS
-// mais antigo) ou que exigem um toque do usuário antes de liberar: mantém um
-// vídeo "ao vivo" (gerado na hora por um canvas parado) tocando em loop, o
-// que também impede a tela de apagar em muitos navegadores.
 const videoNoSleep = document.getElementById('videoNoSleep');
 try {
   const canvas = document.createElement('canvas');
@@ -1165,13 +1307,9 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') ativarProtecaoDeTela();
 });
 
-// Pede assim que a página carrega...
 ativarProtecaoDeTela();
-// ...e de novo no primeiro toque na tela (alguns navegadores só liberam a
-// trava de tela depois de uma interação real do usuário).
 document.addEventListener('touchstart', ativarProtecaoDeTela, { once: true });
 document.addEventListener('click', ativarProtecaoDeTela, { once: true });
-// Reforça periodicamente, caso o navegador solte a trava sozinho.
 setInterval(ativarProtecaoDeTela, 20000);
 
 carregarPassaros();
@@ -1183,8 +1321,313 @@ setInterval(carregarPassaros, 5000);
 
 @app.route('/celular/<codigo>')
 def tela_celular(codigo):
+    codigo = codigo.upper()
+    db.registrar_acesso(codigo, 'celular', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return HTML_CELULAR
 
+
+# ════════════════════════════════════════════════════════════════════
+# TELA ADMIN
+# ════════════════════════════════════════════════════════════════════
+
+HTML_ADMIN = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin - Marcador Digital Goularth</title>
+<style>""" + ESTILO_BASE + """
+.estatistica-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-top:10px; }
+.estatistica-item { background:#0f1830; border-radius:8px; padding:14px; text-align:center; border:1px solid #1a2a4a; }
+.estatistica-item .valor { font-size:32px; font-weight:bold; color:#F0C030; }
+.estatistica-item .label { font-size:11px; color:#93a4c3; margin-top:4px; }
+.estatistica-item .sub-valor { font-size:14px; color:#3ddc84; margin-top:2px; }
+.log-tabela { font-size:12px; }
+.log-tabela td { padding:4px 6px; font-size:11px; }
+.log-tabela .timestamp { color:#5a6d94; white-space:nowrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="faixa-codigo">
+    <div>
+      <h1>⚙️ Painel Admin</h1>
+      <div class="sub">Estatísticas e configurações do sistema</div>
+    </div>
+    <a href="/" class="btn-cinza" style="text-decoration:none; padding:8px 12px; border-radius:8px;">← Voltar</a>
+  </div>
+
+  <!-- Login -->
+  <div id="telaLogin" class="card">
+    <h2 style="margin-top:0">🔐 Acesso Restrito</h2>
+    <div class="sub">Digite a senha para acessar o painel administrativo</div>
+    <input type="password" id="senhaLogin" placeholder="Senha" style="margin-bottom:8px;">
+    <button class="btn-ouro" onclick="fazerLogin()" style="width:100%">Entrar</button>
+    <div id="erroLogin" style="color:#B0271A; margin-top:8px; display:none;">Senha incorreta!</div>
+  </div>
+
+  <!-- Conteúdo Admin -->
+  <div id="telaAdmin" style="display:none;">
+    <!-- Estatísticas -->
+    <div class="card">
+      <h2 style="margin-top:0">📊 Estatísticas em Tempo Real</h2>
+      <div class="estatistica-grid" id="gridStats">
+        <div class="estatistica-item"><div class="valor" id="statSalas">-</div><div class="label">Total de Salas</div></div>
+        <div class="estatistica-item"><div class="valor" id="statSalasAtivas">-</div><div class="label">Salas Ativas (24h)</div></div>
+        <div class="estatistica-item"><div class="valor" id="statAcessos">-</div><div class="label">Total de Acessos</div></div>
+        <div class="estatistica-item"><div class="valor" id="statAcessos24h">-</div><div class="label">Acessos (24h)</div></div>
+        <div class="estatistica-item"><div class="valor" id="statDispositivos">-</div><div class="label">Dispositivos Únicos</div></div>
+        <div class="estatistica-item"><div class="valor" id="statVinculados">-</div><div class="label">Vinculados Agora</div></div>
+        <div class="estatistica-item"><div class="valor" id="statProvas">-</div><div class="label">Provas em Andamento</div></div>
+        <div class="estatistica-item"><div class="valor" id="statPassaros">-</div><div class="label">Total de Pássaros</div></div>
+      </div>
+      <div class="linha-botoes">
+        <button class="btn-azul" onclick="atualizarEstatisticas()" style="flex:1">🔄 Atualizar</button>
+      </div>
+    </div>
+
+    <!-- Top Salas -->
+    <div class="card">
+      <h2 style="margin-top:0">🏆 Salas Mais Acessadas</h2>
+      <table id="tabelaTopSalas">
+        <thead><tr><th>Código</th><th>Acessos</th><th>Último Uso</th></tr></thead>
+        <tbody><tr><td class="vazio" colspan="3">carregando...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- Configurações -->
+    <div class="card">
+      <h2 style="margin-top:0">⚙️ Configurações</h2>
+      
+      <div style="margin-bottom:16px;">
+        <label style="display:block; color:#93a4c3; font-size:12px; margin-bottom:4px;">Imagem do Botão (URL)</label>
+        <input type="text" id="inputImagemBotao" placeholder="URL da imagem (ex: https://exemplo.com/botao.png)">
+        <div class="linha-botoes">
+          <button class="btn-azul" onclick="salvarImagemBotao()">💾 Salvar Imagem</button>
+          <button class="btn-verde" onclick="carregarImagemBotao()">🔄 Carregar</button>
+        </div>
+        <div id="previewImagem" style="margin-top:8px; display:none;">
+          <img id="previewImg" style="max-width:200px; max-height:150px; border-radius:8px; border:1px solid #2a3a63;">
+        </div>
+      </div>
+
+      <div style="border-top:1px solid #1a2a4a; padding-top:16px;">
+        <label style="display:block; color:#93a4c3; font-size:12px; margin-bottom:4px;">Alterar Senha Admin</label>
+        <input type="password" id="senhaAntiga" placeholder="Senha atual">
+        <input type="password" id="senhaNova" placeholder="Nova senha (mínimo 4 caracteres)">
+        <div class="linha-botoes">
+          <button class="btn-ouro" onclick="alterarSenha()">🔑 Alterar Senha</button>
+        </div>
+        <div id="msgSenha" style="margin-top:6px; font-size:13px;"></div>
+      </div>
+    </div>
+
+    <!-- Logs Recentes -->
+    <div class="card">
+      <h2 style="margin-top:0">📋 Logs Recentes</h2>
+      <div class="sub">Últimos 50 acessos</div>
+      <table class="log-tabela" id="tabelaLogs">
+        <thead><tr><th>Data/Hora</th><th>Sala</th><th>Tipo</th><th>Dispositivo</th></tr></thead>
+        <tbody><tr><td class="vazio" colspan="4">carregando...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let token = '';
+
+function fazerLogin() {
+  const senha = document.getElementById('senhaLogin').value;
+  if (!senha) return;
+  
+  fetch('/api/admin/estatisticas', {
+    headers: { 'X-Admin-Password': senha }
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      token = senha;
+      localStorage.setItem('admin_token', senha);
+      document.getElementById('telaLogin').style.display = 'none';
+      document.getElementById('telaAdmin').style.display = 'block';
+      document.getElementById('erroLogin').style.display = 'none';
+      carregarTudo();
+    } else {
+      document.getElementById('erroLogin').style.display = 'block';
+    }
+  })
+  .catch(() => {
+    document.getElementById('erroLogin').style.display = 'block';
+  });
+}
+
+function getHeaders() {
+  return { 'X-Admin-Password': token };
+}
+
+async function carregarTudo() {
+  await atualizarEstatisticas();
+  await carregarLogs();
+  await carregarImagemBotao();
+}
+
+async function atualizarEstatisticas() {
+  try {
+    const resp = await fetch('/api/admin/estatisticas', { headers: getHeaders() });
+    const data = await resp.json();
+    if (!data.ok) return;
+    
+    document.getElementById('statSalas').textContent = data.total_salas;
+    document.getElementById('statSalasAtivas').textContent = data.salas_ativas_24h;
+    document.getElementById('statAcessos').textContent = data.total_acessos;
+    document.getElementById('statAcessos24h').textContent = data.acessos_24h;
+    document.getElementById('statDispositivos').textContent = data.dispositivos_unicos_24h;
+    document.getElementById('statVinculados').textContent = data.vinculados_agora;
+    document.getElementById('statProvas').textContent = data.provas_ativas;
+    document.getElementById('statPassaros').textContent = data.total_passaros;
+    
+    // Top salas
+    const tbody = document.querySelector('#tabelaTopSalas tbody');
+    if (data.salas_top && data.salas_top.length > 0) {
+      tbody.innerHTML = '';
+      data.salas_top.forEach(s => {
+        const tr = document.createElement('tr');
+        const ultimo = new Date(s.ultimo_uso).toLocaleString('pt-BR');
+        tr.innerHTML = `<td><strong style="color:#F0C030;">${s.codigo}</strong></td><td>${s.acessos_total}</td><td>${ultimo}</td>`;
+        tbody.appendChild(tr);
+      });
+    } else {
+      tbody.innerHTML = '<tr><td class="vazio" colspan="3">nenhuma sala com acessos</td></tr>';
+    }
+  } catch (e) {
+    console.error('Erro ao carregar estatísticas:', e);
+  }
+}
+
+async function carregarLogs() {
+  try {
+    const resp = await fetch('/api/admin/logs', { headers: getHeaders() });
+    const data = await resp.json();
+    if (!data.ok) return;
+    
+    const tbody = document.querySelector('#tabelaLogs tbody');
+    if (data.logs && data.logs.length > 0) {
+      tbody.innerHTML = '';
+      data.logs.forEach(log => {
+        const tr = document.createElement('tr');
+        const dataHora = new Date(log.data_hora).toLocaleString('pt-BR');
+        tr.innerHTML = `<td class="timestamp">${dataHora}</td>
+          <td><span style="color:#F0C030;">${log.sala_codigo || '-'}</span></td>
+          <td><span class="tag ${log.tipo_acesso === 'organizador' ? 'tag-ok' : log.tipo_acesso === 'celular' ? 'tag-ok' : 'tag-nao'}">${log.tipo_acesso}</span></td>
+          <td style="font-size:10px; font-family:monospace;">${log.esp32_id || log.ip || '-'}</td>`;
+        tbody.appendChild(tr);
+      });
+    } else {
+      tbody.innerHTML = '<tr><td class="vazio" colspan="4">nenhum log registrado</td></tr>';
+    }
+  } catch (e) {
+    console.error('Erro ao carregar logs:', e);
+  }
+}
+
+async function carregarImagemBotao() {
+  try {
+    const resp = await fetch('/api/admin/imagem', { headers: getHeaders() });
+    const data = await resp.json();
+    if (data.ok && data.imagem) {
+      document.getElementById('inputImagemBotao').value = data.imagem;
+      document.getElementById('previewImg').src = data.imagem;
+      document.getElementById('previewImagem').style.display = 'block';
+    }
+  } catch (e) {}
+}
+
+async function salvarImagemBotao() {
+  const imagem = document.getElementById('inputImagemBotao').value.trim();
+  try {
+    const resp = await fetch('/api/admin/imagem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getHeaders() },
+      body: JSON.stringify({ imagem })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      alert('Imagem salva com sucesso!');
+      if (imagem) {
+        document.getElementById('previewImg').src = imagem;
+        document.getElementById('previewImagem').style.display = 'block';
+      } else {
+        document.getElementById('previewImagem').style.display = 'none';
+      }
+    } else {
+      alert('Erro: ' + (data.erro || 'desconhecido'));
+    }
+  } catch (e) {
+    alert('Erro ao salvar imagem.');
+  }
+}
+
+async function alterarSenha() {
+  const senhaAntiga = document.getElementById('senhaAntiga').value;
+  const senhaNova = document.getElementById('senhaNova').value;
+  const msgEl = document.getElementById('msgSenha');
+  
+  if (!senhaNova || senhaNova.length < 4) {
+    msgEl.style.color = '#B0271A';
+    msgEl.textContent = '❌ A nova senha deve ter pelo menos 4 caracteres.';
+    return;
+  }
+  
+  try {
+    const resp = await fetch('/api/admin/senha', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getHeaders() },
+      body: JSON.stringify({ senha_antiga: senhaAntiga, senha_nova: senhaNova })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      msgEl.style.color = '#3ddc84';
+      msgEl.textContent = '✅ Senha alterada com sucesso!';
+      token = senhaNova;
+      localStorage.setItem('admin_token', senhaNova);
+      document.getElementById('senhaAntiga').value = '';
+      document.getElementById('senhaNova').value = '';
+    } else {
+      msgEl.style.color = '#B0271A';
+      msgEl.textContent = '❌ ' + (data.erro || 'Erro ao alterar senha.');
+    }
+  } catch (e) {
+    msgEl.style.color = '#B0271A';
+    msgEl.textContent = '❌ Erro de rede.';
+  }
+}
+
+// Atualização automática a cada 10 segundos
+setInterval(() => {
+  if (token) {
+    atualizarEstatisticas();
+  }
+}, 10000);
+
+// Tentar login automático se já tiver token
+if (localStorage.getItem('admin_token')) {
+  document.getElementById('senhaLogin').value = localStorage.getItem('admin_token');
+  fazerLogin();
+}
+</script>
+</body>
+</html>"""
+
+
+@app.route('/admin')
+def tela_admin():
+    return HTML_ADMIN
+
+
+# ════════════════════════════════════════════════════════════════════
+# INICIALIZAÇÃO E EXECUÇÃO
+# ════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     porta = int(os.environ.get('PORT', 5000))
