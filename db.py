@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import queue
 import threading
 import datetime
 
@@ -29,7 +31,11 @@ def _obter_pool():
                         "DATABASE_URL não configurada. Defina essa variável de "
                         "ambiente com a connection string do Neon antes de rodar."
                     )
-                _pool = ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+                # 20 conexões dá folga pro pico de "tick" simultâneo de vários
+                # celulares + o polling da tela do organizador. Se a
+                # connection string do Neon tiver "-pooler" no host (pooler
+                # do próprio Neon/pgbouncer), isso é ainda mais barato.
+                _pool = ThreadedConnectionPool(1, 20, DATABASE_URL, sslmode='require')
     return _pool
 
 
@@ -49,6 +55,69 @@ class conexao:
             self._cur.close()
             _obter_pool().putconn(self._conn)
         return False
+
+
+# ════════════════════════════════════════════════════════════════════
+# LOG DE ACESSO — GRAVAÇÃO ASSÍNCRONA
+#
+# Antes, toda chamada de API (inclusive o "tick" do celular, chamado até
+# 5x por segundo, e o polling do cronômetro do organizador) esperava uma
+# viagem extra até o Neon só pra gravar uma linha de log. Isso sozinho já
+# dobrava/triplicava o tempo de resposta de tudo. Agora o log só entra
+# numa fila em memória (instantâneo) e uma thread em segundo plano grava
+# em lote de tempos em tempos — a resposta ao celular/organizador não
+# espera mais por isso.
+# ════════════════════════════════════════════════════════════════════
+
+_log_queue = queue.Queue()
+_log_worker_iniciado = False
+_log_worker_lock = threading.Lock()
+
+
+def _iniciar_log_worker():
+    global _log_worker_iniciado
+    if _log_worker_iniciado:
+        return
+    with _log_worker_lock:
+        if _log_worker_iniciado:
+            return
+        t = threading.Thread(target=_log_worker, daemon=True)
+        t.start()
+        _log_worker_iniciado = True
+
+
+def _log_worker():
+    while True:
+        item = _log_queue.get()
+        lote = [item]
+        # drena o que mais já estiver esperando, pra gravar tudo de uma vez
+        while len(lote) < 200:
+            try:
+                lote.append(_log_queue.get_nowait())
+            except queue.Empty:
+                break
+        try:
+            with conexao() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO logs_acesso (sala_codigo, tipo_acesso, esp32_id, ip, user_agent)
+                       VALUES %s""",
+                    lote
+                )
+                # conta acessos de organizador/celular por sala, em lote,
+                # em vez de um UPDATE por evento
+                contagem = {}
+                for codigo, tipo_acesso, *_ in lote:
+                    if codigo and tipo_acesso in ('organizador', 'celular'):
+                        contagem[codigo] = contagem.get(codigo, 0) + 1
+                for codigo, qtd in contagem.items():
+                    cur.execute(
+                        "UPDATE salas SET acessos_total = acessos_total + %s WHERE codigo = %s",
+                        (qtd, codigo)
+                    )
+        except Exception as e:
+            print(f"⚠ erro ao gravar logs de acesso em lote: {e}")
+        time.sleep(0.5)  # evita martelar o banco em rajadas de tick
 
 
 def inicializar_schema():
@@ -197,42 +266,57 @@ def formatar_tempo(seg):
 def criar_sala(codigo):
     with conexao() as cur:
         cur.execute("INSERT INTO salas (codigo) VALUES (%s)", (codigo,))
-        for tipo, duracao in DURACAO_PADRAO.items():
-            cur.execute(
-                "INSERT INTO provas (sala_codigo, tipo, duracao) VALUES (%s, %s, %s)",
-                (codigo, tipo, duracao)
-            )
+        # as 2 provas (eliminatória + final) num INSERT só, em vez de 2
+        cur.execute(
+            """INSERT INTO provas (sala_codigo, tipo, duracao) VALUES
+               (%s, 'eliminatorias', %s), (%s, 'final', %s)""",
+            (codigo, DURACAO_PADRAO['eliminatorias'], codigo, DURACAO_PADRAO['final'])
+        )
+
+
+_ultimo_toque = {}
+_ultimo_toque_lock = threading.Lock()
+_TOQUE_INTERVALO = 30  # segundos — não precisa atualizar "ultimo_uso" a cada tick
 
 
 def sala_existe(codigo):
+    """Verifica se a sala existe. Antes fazia sempre 2 viagens ao banco
+    (SELECT + UPDATE de ultimo_uso) em toda chamada — inclusive nos ticks do
+    celular, 5x por segundo. Agora só toca ultimo_uso a cada 30s por sala
+    (guardado em memória) e, quando não precisa tocar, faz só 1 SELECT leve."""
+    agora = time.monotonic()
+    with _ultimo_toque_lock:
+        precisa_tocar = (agora - _ultimo_toque.get(codigo, 0)) > _TOQUE_INTERVALO
+
+    if precisa_tocar:
+        with conexao() as cur:
+            cur.execute("UPDATE salas SET ultimo_uso = now() WHERE codigo = %s RETURNING 1", (codigo,))
+            existe = cur.fetchone() is not None
+        if existe:
+            with _ultimo_toque_lock:
+                _ultimo_toque[codigo] = agora
+        return existe
+
     with conexao() as cur:
         cur.execute("SELECT 1 FROM salas WHERE codigo = %s", (codigo,))
-        existe = cur.fetchone() is not None
-    if existe:
-        tocar_sala(codigo)
-    return existe
+        return cur.fetchone() is not None
 
 
 def tocar_sala(codigo):
     with conexao() as cur:
         cur.execute("UPDATE salas SET ultimo_uso = now() WHERE codigo = %s", (codigo,))
+    with _ultimo_toque_lock:
+        _ultimo_toque[codigo] = time.monotonic()
 
 
 def registrar_acesso(codigo, tipo_acesso, esp32_id=None, ip=None, user_agent=None):
+    """Enfileira o log de acesso para gravação em segundo plano (não bloqueia
+    a resposta da requisição — ver _log_worker acima)."""
+    _iniciar_log_worker()
     try:
-        with conexao() as cur:
-            if codigo:
-                cur.execute(
-                    "INSERT INTO logs_acesso (sala_codigo, tipo_acesso, esp32_id, ip, user_agent) VALUES (%s, %s, %s, %s, %s)",
-                    (codigo, tipo_acesso, esp32_id, ip, user_agent)
-                )
-                if tipo_acesso in ('organizador', 'celular'):
-                    cur.execute(
-                        "UPDATE salas SET acessos_total = acessos_total + 1 WHERE codigo = %s",
-                        (codigo,)
-                    )
+        _log_queue.put_nowait((codigo, tipo_acesso, esp32_id, ip, user_agent))
     except Exception as e:
-        print(f"⚠ erro ao registrar acesso: {e}")
+        print(f"⚠ erro ao enfileirar log de acesso: {e}")
 
 
 def obter_quantidade_classificados(codigo):
@@ -498,22 +582,24 @@ def desvincular(codigo, tipo, item_id):
 
 
 def tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_segundos):
+    """Chamado até 5x/segundo por celular. Antes fazia sempre um SELECT com
+    JOIN e depois, condicionalmente, um UPDATE — 2 viagens ao banco em cada
+    chamada. Agora é 1 UPDATE só (que já filtra prova ativa e retorna o
+    vínculo), e nem isso quando não há tempo válido pra salvar (ex.: antes
+    de apertar o botão pela 1ª vez)."""
+    if not tempo_valido:
+        return None
     with conexao() as cur:
         cur.execute(
-            """SELECT i.id, i.tipo, p.ativa FROM itens i
-               JOIN provas p ON p.sala_codigo = i.sala_codigo AND p.tipo = i.tipo
-               WHERE i.sala_codigo = %s AND i.esp32_id = %s""",
-            (codigo, esp32_id)
+            """UPDATE itens i SET tempo_texto = %s, tempo_segundos = %s
+               FROM provas p
+               WHERE p.sala_codigo = i.sala_codigo AND p.tipo = i.tipo
+                 AND i.sala_codigo = %s AND i.esp32_id = %s AND p.ativa = true
+               RETURNING i.id, i.tipo""",
+            (tempo_str, tempo_segundos, codigo, esp32_id)
         )
-        vinculo = cur.fetchone()
-        if vinculo and tempo_valido and vinculo['ativa']:
-            cur.execute(
-                "UPDATE itens SET tempo_texto = %s, tempo_segundos = %s WHERE id = %s",
-                (tempo_str, tempo_segundos, vinculo['id'])
-            )
-    if vinculo:
-        return (vinculo['tipo'], vinculo['id'])
-    return None
+        linha = cur.fetchone()
+    return (linha['tipo'], linha['id']) if linha else None
 
 
 # ════════════════════════════════════════════════════════════════════

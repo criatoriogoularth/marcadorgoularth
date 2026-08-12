@@ -699,7 +699,8 @@ function mostrarTela(nome) {
     tipoProvaAtual = nome;
     document.getElementById('tituloProva').textContent = nome === 'eliminatorias' ? '🔵 Eliminatória' : '🔴 Final';
     document.getElementById('btnClassificar').style.display = nome === 'eliminatorias' ? 'inline-block' : 'none';
-    atualizarProva();
+    ultimaProva = null;
+    sincronizarProva();
   }
   if (nome === 'geral') { renderGeral(); }
 }
@@ -788,31 +789,27 @@ async function adicionarTodosAProva() {
 }
 
 // ═══════ PROVA ═══════
-async function atualizarProva() {
+// Antes, o relógio inteiro dependia de um fetch novo a cada 1s: qualquer
+// oscilação de rede (ou latência até o Neon) aparecia direto como
+// travadinha no cronômetro. Agora o servidor é consultado com menos
+// frequência (2s) só pra corrigir o valor e atualizar a tabela; o número
+// do relógio em si é desenhado localmente a cada 100ms a partir do último
+// tempo_restante recebido — fica liso mesmo se a rede engasgar.
+let ultimaProva = null;
+let ultimaProvaEm = 0; // performance.now() de quando ultimaProva foi lida
+
+async function sincronizarProva() {
   if (telaAtual !== 'eliminatorias' && telaAtual !== 'final') return;
   try {
     const resp = await fetch(`/api/sala/${codigo}/prova/${tipoProvaAtual}`);
     const data = await resp.json();
     if (!data.ok) { marcarOffline(true); return; }
     marcarOffline(false);
+    ultimaProva = data;
+    ultimaProvaEm = performance.now();
 
     const status = data.finalizada ? 'finalizada' : (data.ativa ? 'em andamento' : 'aguardando início');
     document.getElementById('statusProva').textContent = `${data.itens.length} pássaro(s) — prova ${status}`;
-
-    const blocoRelogio = document.getElementById('blocoRelogio');
-    if (data.ativa) {
-      blocoRelogio.style.display = 'block';
-      blocoRelogio.classList.toggle('acabando', data.tempo_restante <= 30);
-      document.getElementById('relogioNumero').textContent = formatarMMSSmmm(data.tempo_restante);
-      document.getElementById('relogioLegenda').textContent = 'tempo restante da prova (finaliza sozinho)';
-    } else if (data.finalizada) {
-      blocoRelogio.style.display = 'block';
-      blocoRelogio.classList.remove('acabando');
-      document.getElementById('relogioNumero').textContent = '00:00:000';
-      document.getElementById('relogioLegenda').textContent = 'prova finalizada';
-    } else {
-      blocoRelogio.style.display = 'none';
-    }
 
     const tbody = document.querySelector('#tabelaProva tbody');
     if (data.itens.length === 0) {
@@ -832,6 +829,26 @@ async function atualizarProva() {
   }
 }
 
+function desenharRelogio() {
+  if (!ultimaProva || (telaAtual !== 'eliminatorias' && telaAtual !== 'final')) return;
+  const blocoRelogio = document.getElementById('blocoRelogio');
+  if (ultimaProva.ativa) {
+    const decorridoLocal = (performance.now() - ultimaProvaEm) / 1000;
+    const restante = Math.max(0, ultimaProva.tempo_restante - decorridoLocal);
+    blocoRelogio.style.display = 'block';
+    blocoRelogio.classList.toggle('acabando', restante <= 30);
+    document.getElementById('relogioNumero').textContent = formatarMMSSmmm(restante);
+    document.getElementById('relogioLegenda').textContent = 'tempo restante da prova (finaliza sozinho)';
+  } else if (ultimaProva.finalizada) {
+    blocoRelogio.style.display = 'block';
+    blocoRelogio.classList.remove('acabando');
+    document.getElementById('relogioNumero').textContent = '00:00:000';
+    document.getElementById('relogioLegenda').textContent = 'prova finalizada';
+  } else {
+    blocoRelogio.style.display = 'none';
+  }
+}
+
 async function acaoProva(acao) {
   if (acao === 'limpar' && !confirm('Tem certeza? Isso apaga os tempos e desvincula os celulares dessa prova.')) return;
   if (acao === 'finalizar' && !confirm('Finalizar esta prova? Os celulares vinculados serão travados.')) return;
@@ -844,7 +861,7 @@ async function acaoProva(acao) {
     marcarOffline(true);
     alert('Sem conexão com o servidor da sala agora.');
   }
-  atualizarProva();
+  sincronizarProva();
 }
 
 async function classificarParaFinal() {
@@ -991,10 +1008,9 @@ async function sincronizarFundo() {
   if (telaAtual === 'geral') renderGeral();
 }
 
-setInterval(() => {
-  if (telaAtual === 'eliminatorias' || telaAtual === 'final') atualizarProva();
-}, 1000);
-setInterval(sincronizarFundo, 2000);
+setInterval(desenharRelogio, 100);   // desenho local do relógio, sem rede
+setInterval(sincronizarProva, 2000); // correção + tabela, com rede
+setInterval(sincronizarFundo, 3000);
 
 mostrarTela('cadastro');
 </script>
