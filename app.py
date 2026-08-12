@@ -3,6 +3,8 @@ import time
 import random
 import string
 import threading
+import base64
+from io import BytesIO
 
 from flask import Flask, request, jsonify
 
@@ -78,6 +80,55 @@ def api_admin_imagem():
     imagem = dados.get('imagem', '')
     db.definir_config_admin("imagem_botao", imagem)
     return jsonify({"ok": True})
+
+
+@app.route('/api/admin/upload_imagem', methods=['POST'])
+def api_admin_upload_imagem():
+    """Faz upload de uma imagem para usar como botão."""
+    senha = request.headers.get('X-Admin-Password', '')
+    if not db.verificar_senha_admin(senha):
+        return jsonify({"ok": False, "erro": "senha inválida"}), 401
+    
+    dados = request.get_json(force=True) or {}
+    imagem_base64 = dados.get('imagem', '')
+    
+    if not imagem_base64:
+        return jsonify({"ok": False, "erro": "nenhuma imagem enviada"}), 400
+    
+    try:
+        # Remover prefixo data:image/...;base64, se existir
+        if ',' in imagem_base64:
+            imagem_base64 = imagem_base64.split(',')[1]
+        
+        # Decodificar a imagem
+        imagem_bytes = base64.b64decode(imagem_base64)
+        
+        # Verificar se é uma imagem válida
+        try:
+            from PIL import Image
+            img = Image.open(BytesIO(imagem_bytes))
+            
+            # Redimensionar para não ficar muito grande (max 300px de altura)
+            if img.height > 300:
+                ratio = 300 / img.height
+                novo_tamanho = (int(img.width * ratio), 300)
+                img = img.resize(novo_tamanho, Image.Resampling.LANCZOS)
+            
+            # Converter para base64 novamente
+            buffer = BytesIO()
+            img.save(buffer, format='PNG')
+            imagem_otimizada = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            imagem_final = f"data:image/png;base64,{imagem_otimizada}"
+        except:
+            # Se não tiver PIL, salva a imagem original
+            imagem_final = f"data:image/png;base64,{imagem_base64}"
+        
+        # Salvar no banco
+        db.definir_config_admin("imagem_botao", imagem_final)
+        
+        return jsonify({"ok": True, "mensagem": "Imagem salva com sucesso!"})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": f"Erro ao processar imagem: {str(e)}"}), 400
 
 
 @app.route('/api/admin/senha', methods=['POST'])
@@ -483,7 +534,7 @@ def tela_home():
 
 
 # ════════════════════════════════════════════════════════════════════
-# TELA ORGANIZADOR
+# TELA ORGANIZADOR (COMPLETA)
 # ════════════════════════════════════════════════════════════════════
 
 HTML_ORGANIZADOR = """<!DOCTYPE html>
@@ -495,7 +546,7 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <style>""" + ESTILO_BASE + """
 .faixa-codigo { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
 .relogio { text-align:center; margin:6px 0 16px; }
-.relogio-numero { font-family:monospace; font-size:52px; color:#F0C030; font-weight:bold; letter-spacing:2px; }
+.relogio-numero { font-family:monospace; font-size:48px; color:#F0C030; font-weight:bold; letter-spacing:2px; }
 .relogio-legenda { color:#93a4c3; font-size:12px; }
 .relogio.acabando .relogio-numero { color:#B0271A; }
 .aviso-offline { background:#4a1414; border:1px solid #B0271A; color:#ffd0cc; padding:10px 12px;
@@ -621,6 +672,7 @@ function copiarLinkCelular() {
   alert('Link copiado:\\n' + link + '\\n\\nManda pra quem vai usar o celular como marcador.');
 }
 
+// ═══════ FORMATAR TEMPO COM MILÉSIMOS ═══════
 function formatarMMSSmmm(segundos) {
   segundos = Math.max(0, segundos);
   const mm = String(Math.floor(segundos / 60)).padStart(2, '0');
@@ -958,7 +1010,7 @@ def tela_organizador(codigo):
 
 
 # ════════════════════════════════════════════════════════════════════
-# TELA CELULAR (VERSÃO MELHORADA - COMPLETA)
+# TELA CELULAR
 # ════════════════════════════════════════════════════════════════════
 
 HTML_CELULAR = """<!DOCTYPE html>
@@ -981,24 +1033,15 @@ HTML_CELULAR = """<!DOCTYPE html>
   .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:38px; text-align:center; 
                 margin-top:4px; letter-spacing:2px; text-shadow:0 0 20px #3ddc8444; font-weight:bold; }
   .botao-canto { 
-    width:100%; padding:0; border-radius:24px; border:none; background:#1a2a4a; 
-    box-shadow:0 6px 0 #0d1a30, 0 8px 20px rgba(0,0,0,0.5); 
+    width:100%; padding:16px; border-radius:24px; border:none; 
+    font-weight:bold; font-size:22px; color:white; background:#1558B0; 
+    box-shadow:0 6px 0 #0d3a7c, 0 8px 20px rgba(0,0,0,0.5); 
     touch-action:none; overflow:hidden; position:relative; transition:all 0.05s;
-    cursor:pointer;
+    cursor:pointer; text-align:center;
   }
-  .botao-canto img { 
-    width:100%; height:auto; display:block; border-radius:24px;
-    transition:filter 0.2s;
-  }
-  .botao-canto.pressionado { transform:scale(0.97); box-shadow:0 2px 0 #0d1a30; }
-  .botao-canto:disabled { opacity:0.5; transform:none; box-shadow:0 6px 0 #0d1a30; cursor:default; }
-  .botao-canto:disabled img { filter:grayscale(0.8); }
-  .botao-canto .overlay-text {
-    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-    font-weight:bold; font-size:22px; color:white; text-shadow:0 2px 10px rgba(0,0,0,0.9);
-    pointer-events:none; background:rgba(0,0,0,0.2);
-  }
-  .botao-canto.pressionado .overlay-text { background:rgba(0,80,30,0.3); color:#3ddc84; }
+  .botao-canto.pressionado { background:#177A38; box-shadow:0 2px 0 #0d3a7c; transform:scale(0.97); }
+  .botao-canto:disabled { background:#374158; box-shadow:0 6px 0 #232a3a; color:#7c88a6; cursor:default; opacity:0.6; }
+  .botao-canto img { max-width:100%; max-height:120px; border-radius:12px; display:block; margin:0 auto; }
   .passaro-card { 
     padding:16px; margin:6px 0; background:#16213d; border-radius:10px; 
     cursor:pointer; transition:all 0.2s; border-left:3px solid #C9980E;
@@ -1028,7 +1071,6 @@ HTML_CELULAR = """<!DOCTYPE html>
     <span class="bolinha" id="bolinhaStatus"></span><span id="textoStatus">conectando...</span>
   </div>
 
-  <!-- TELA DE VINCULAR -->
   <div id="telaVincular">
     <div class="cat-titulo">🔵 ELIMINATÓRIA</div>
     <div id="listaElim"><div class="vazio">carregando...</div></div>
@@ -1036,7 +1078,6 @@ HTML_CELULAR = """<!DOCTYPE html>
     <div id="listaFinal"><div class="vazio">carregando...</div></div>
   </div>
 
-  <!-- TELA DO MARCADOR -->
   <div id="telaMarcador" style="display:none;">
     <div class="vinculado-atual">
       📌 Vinculado: <strong id="nomeVinculado">-</strong>
@@ -1046,8 +1087,7 @@ HTML_CELULAR = """<!DOCTYPE html>
       <div class="lcd-linha1" id="lcdLinha1">00:00:000</div>
     </div>
     <button class="botao-canto" id="botaoCanto">
-      <img id="imgBotao" src="" alt="Botão" style="display:none;">
-      <div class="overlay-text" id="overlayText">AGUARDANDO</div>
+      <span id="textoBotao">AGUARDANDO</span>
     </button>
     <button class="btn-trocar" onclick="trocarPassaro()">🔄 Trocar pássaro vinculado</button>
   </div>
@@ -1079,6 +1119,7 @@ let nomePassaroAtual = '';
 let syncAtiva = false;
 let syncTempoRestanteMs = 0;
 let syncRecebidoEm = 0;
+let imagemBotao = '';
 
 function formatarTempo(msTotal) {
   if (msTotal < 0) msTotal = 0;
@@ -1145,14 +1186,15 @@ function parseTempoParaMs(str) {
 
 function atualizarBotao() {
   const btn = document.getElementById('botaoCanto');
-  const overlay = document.getElementById('overlayText');
+  const texto = document.getElementById('textoBotao');
   btn.disabled = botaoBloqueado;
+  
   if (faseAtual === 2) {
-    overlay.textContent = '🏁 FINALIZADA';
+    texto.textContent = '🏁 FINALIZADA';
   } else if (botaoBloqueado) {
-    overlay.textContent = '⏳ AGUARDANDO';
+    texto.textContent = '⏳ AGUARDANDO';
   } else {
-    overlay.textContent = '🔴 SEGURE PARA CANTAR';
+    texto.textContent = '🔴 SEGURE PARA CANTAR';
   }
 }
 
@@ -1162,10 +1204,15 @@ async function carregarImagemBotao() {
     const resp = await fetch('/api/admin/imagem');
     const data = await resp.json();
     if (data.ok && data.imagem) {
-      const img = document.getElementById('imgBotao');
-      img.src = data.imagem;
-      img.style.display = 'block';
-      img.onerror = () => { img.style.display = 'none'; };
+      imagemBotao = data.imagem;
+      const btn = document.getElementById('botaoCanto');
+      const texto = document.getElementById('textoBotao');
+      if (imagemBotao) {
+        btn.innerHTML = `<img src="${imagemBotao}" alt="Botão">`;
+      } else {
+        btn.innerHTML = '<span id="textoBotao">AGUARDANDO</span>';
+      }
+      atualizarBotao();
     }
   } catch (e) {}
 }
@@ -1191,6 +1238,8 @@ botaoEl.addEventListener('pointercancel', pararCanto);
 botaoEl.addEventListener('pointerleave', pararCanto);
 
 let tickEmAndamento = false;
+let ultimoTick = 0;
+
 setInterval(() => {
   let displayTime = totalTime;
   if (isRunning) displayTime += Date.now() - startTime;
@@ -1204,11 +1253,13 @@ setInterval(() => {
     document.getElementById('lcdLinha0').textContent = '⏱️ ' + formatarTempo(restante);
   }
 
-  if (!tickEmAndamento) {
+  const agora = Date.now();
+  if (!tickEmAndamento && (agora - ultimoTick > 200)) {
+    ultimoTick = agora;
     tickEmAndamento = true;
     enviarTick(provaIniciada ? bufLocal : '').finally(() => { tickEmAndamento = false; });
   }
-}, 100);
+}, 50);
 
 async function carregarPassaros() {
   try {
@@ -1345,6 +1396,7 @@ HTML_ADMIN = """<!DOCTYPE html>
 .log-tabela { font-size:12px; }
 .log-tabela td { padding:4px 6px; font-size:11px; }
 .log-tabela .timestamp { color:#5a6d94; white-space:nowrap; }
+.preview-img { max-width:200px; max-height:150px; border-radius:8px; border:1px solid #2a3a63; }
 </style>
 </head>
 <body>
@@ -1400,15 +1452,17 @@ HTML_ADMIN = """<!DOCTYPE html>
       <h2 style="margin-top:0">⚙️ Configurações</h2>
       
       <div style="margin-bottom:16px;">
-        <label style="display:block; color:#93a4c3; font-size:12px; margin-bottom:4px;">Imagem do Botão (URL)</label>
-        <input type="text" id="inputImagemBotao" placeholder="URL da imagem (ex: https://exemplo.com/botao.png)">
-        <div class="linha-botoes">
-          <button class="btn-azul" onclick="salvarImagemBotao()">💾 Salvar Imagem</button>
-          <button class="btn-verde" onclick="carregarImagemBotao()">🔄 Carregar</button>
+        <label style="display:block; color:#93a4c3; font-size:12px; margin-bottom:4px;">Imagem do Botão</label>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+          <input type="file" id="inputFileImagem" accept="image/*" style="display:none;">
+          <button class="btn-azul" onclick="document.getElementById('inputFileImagem').click()">📁 Escolher imagem da galeria</button>
+          <button class="btn-verde" onclick="enviarImagem()">📤 Enviar imagem</button>
+          <button class="btn-vermelho" onclick="removerImagem()">🗑️ Remover imagem</button>
         </div>
         <div id="previewImagem" style="margin-top:8px; display:none;">
-          <img id="previewImg" style="max-width:200px; max-height:150px; border-radius:8px; border:1px solid #2a3a63;">
+          <img id="previewImg" class="preview-img">
         </div>
+        <div id="msgUpload" style="margin-top:6px; font-size:13px;"></div>
       </div>
 
       <div style="border-top:1px solid #1a2a4a; padding-top:16px;">
@@ -1487,7 +1541,6 @@ async function atualizarEstatisticas() {
     document.getElementById('statProvas').textContent = data.provas_ativas;
     document.getElementById('statPassaros').textContent = data.total_passaros;
     
-    // Top salas
     const tbody = document.querySelector('#tabelaTopSalas tbody');
     if (data.salas_top && data.salas_top.length > 0) {
       tbody.innerHTML = '';
@@ -1536,35 +1589,77 @@ async function carregarImagemBotao() {
     const resp = await fetch('/api/admin/imagem', { headers: getHeaders() });
     const data = await resp.json();
     if (data.ok && data.imagem) {
-      document.getElementById('inputImagemBotao').value = data.imagem;
       document.getElementById('previewImg').src = data.imagem;
       document.getElementById('previewImagem').style.display = 'block';
+    } else {
+      document.getElementById('previewImagem').style.display = 'none';
     }
   } catch (e) {}
 }
 
-async function salvarImagemBotao() {
-  const imagem = document.getElementById('inputImagemBotao').value.trim();
+document.getElementById('inputFileImagem').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (file) {
+    const reader = new FileReader();
+    reader.onload = function(event) {
+      document.getElementById('previewImg').src = event.target.result;
+      document.getElementById('previewImagem').style.display = 'block';
+      document.getElementById('msgUpload').textContent = '✅ Imagem selecionada. Clique em "Enviar imagem" para salvar.';
+      document.getElementById('msgUpload').style.color = '#3ddc84';
+    };
+    reader.readAsDataURL(file);
+  }
+});
+
+async function enviarImagem() {
+  const img = document.getElementById('previewImg');
+  if (!img.src || img.src === '') {
+    document.getElementById('msgUpload').textContent = '❌ Selecione uma imagem primeiro!';
+    document.getElementById('msgUpload').style.color = '#B0271A';
+    return;
+  }
+  
+  try {
+    const resp = await fetch('/api/admin/upload_imagem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getHeaders() },
+      body: JSON.stringify({ imagem: img.src })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      document.getElementById('msgUpload').textContent = '✅ ' + data.mensagem;
+      document.getElementById('msgUpload').style.color = '#3ddc84';
+    } else {
+      document.getElementById('msgUpload').textContent = '❌ ' + (data.erro || 'Erro ao salvar imagem');
+      document.getElementById('msgUpload').style.color = '#B0271A';
+    }
+  } catch (e) {
+    document.getElementById('msgUpload').textContent = '❌ Erro de rede.';
+    document.getElementById('msgUpload').style.color = '#B0271A';
+  }
+}
+
+async function removerImagem() {
+  if (!confirm('Remover a imagem do botão?')) return;
   try {
     const resp = await fetch('/api/admin/imagem', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...getHeaders() },
-      body: JSON.stringify({ imagem })
+      body: JSON.stringify({ imagem: '' })
     });
     const data = await resp.json();
     if (data.ok) {
-      alert('Imagem salva com sucesso!');
-      if (imagem) {
-        document.getElementById('previewImg').src = imagem;
-        document.getElementById('previewImagem').style.display = 'block';
-      } else {
-        document.getElementById('previewImagem').style.display = 'none';
-      }
+      document.getElementById('previewImagem').style.display = 'none';
+      document.getElementById('inputFileImagem').value = '';
+      document.getElementById('msgUpload').textContent = '✅ Imagem removida!';
+      document.getElementById('msgUpload').style.color = '#3ddc84';
     } else {
-      alert('Erro: ' + (data.erro || 'desconhecido'));
+      document.getElementById('msgUpload').textContent = '❌ ' + (data.erro || 'Erro ao remover imagem');
+      document.getElementById('msgUpload').style.color = '#B0271A';
     }
   } catch (e) {
-    alert('Erro ao salvar imagem.');
+    document.getElementById('msgUpload').textContent = '❌ Erro de rede.';
+    document.getElementById('msgUpload').style.color = '#B0271A';
   }
 }
 
@@ -1603,14 +1698,12 @@ async function alterarSenha() {
   }
 }
 
-// Atualização automática a cada 10 segundos
 setInterval(() => {
   if (token) {
     atualizarEstatisticas();
   }
 }, 10000);
 
-// Tentar login automático se já tiver token
 if (localStorage.getItem('admin_token')) {
   document.getElementById('senhaLogin').value = localStorage.getItem('admin_token');
   fazerLogin();
