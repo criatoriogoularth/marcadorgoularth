@@ -1079,7 +1079,7 @@ function pararCanto(ev) {
   if (!isRunning) return;
   isRunning = false;
   totalTime += Date.now() - startTime;
-  enviarValorFinalPendente = true;   // manda o valor congelado pro servidor uma última vez
+  enviarValorFinalPendente = true;   // manda o valor final (parado) pro servidor uma vez
   botaoEl.classList.remove('pressionado');
 }
 botaoEl.addEventListener('pointerdown', iniciarCanto);
@@ -1102,13 +1102,18 @@ setInterval(() => {
     document.getElementById('lcdLinha0').textContent = 'PROVA ' + formatarTempo(restante);
   }
 
-  // só grava no banco enquanto está contando (ou uma última vez ao soltar);
-  // parado, não tem motivo pra reescrever o mesmo valor 10x por segundo —
-  // isso reduz bastante o atraso entre o celular e a tela do organizador
-  if (!tickEmAndamento && (isRunning || enviarValorFinalPendente)) {
+  // o tick precisa continuar sendo enviado a cada 100ms mesmo parado —
+  // é ele que traz os comandos do servidor (ex: "a prova começou", "troca
+  // de pássaro", etc). O que fica mais leve é só o que ele GRAVA no banco:
+  // parado, manda o tempo vazio (não grava nada novo, só recebe comandos);
+  // ao soltar o botão, manda o valor final uma vez pra garantir que fica
+  // salvo; enquanto está contando, grava normalmente a cada 100ms.
+  if (!tickEmAndamento) {
     tickEmAndamento = true;
-    enviarValorFinalPendente = false;
-    enviarTick(provaIniciada ? bufLocal : '').finally(() => { tickEmAndamento = false; });
+    let valor = '';
+    if (isRunning) valor = bufLocal;
+    else if (enviarValorFinalPendente) { valor = bufLocal; enviarValorFinalPendente = false; }
+    enviarTick(valor).finally(() => { tickEmAndamento = false; });
   }
 }, 100);
 
