@@ -42,7 +42,10 @@ configurar a variável.
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `gunicorn app:app --worker-class gthread --threads 8 --workers 1 --bind 0.0.0.0:$PORT`
 4. Em **Environment**, adiciona a variável `DATABASE_URL` com a connection
-   string do Neon (a mesma do passo 1).
+   string do Neon (a mesma do passo 1). Opcionalmente, adiciona também
+   `SECRET_KEY` (qualquer texto aleatório longo) — sem ela o site gera uma
+   sozinho, mas aí toda vez que o Render reiniciar o servidor sua sessão
+   de admin (`/admin`) vai pedir senha de novo.
 5. Plano gratuito do Render serve bem pra isso (o app é leve). O servidor
    ainda "dorme" depois de um tempo sem acesso — mas agora isso não é mais
    problema: os dados moram no Neon, não na memória do programa, então
@@ -72,26 +75,52 @@ configurar a variável.
    Final (a Eliminatória é só classificatória). Botão **Gerar imagem pra
    compartilhar** cria um PNG pronto pra mandar no WhatsApp.
 
-## Painel Admin
+## Painel do administrador (`/admin`)
 
-Acessível em `/admin` (link discreto "⚙️ Admin" no canto da tela do
-organizador). Senha padrão: `123456` — troque assim que entrar, tem um
-campo pra isso no próprio painel. Mostra estatísticas gerais (salas,
-acessos, dispositivos vinculados) e os últimos 50 logs de acesso.
+Existe uma aba separada, em `SEU-SITE.onrender.com/admin`, só pra você (dono
+do site) — não é a mesma coisa que o código de sala.
 
-Pra não pesar em nada no cronômetro/celular, esse log é gravado em
-segundo plano (fila em memória + gravação em lote), e só registra ações
-que mudam de fato o estado (cadastrar, iniciar/finalizar/limpar prova,
-classificar, vincular celular) — o polling do cronômetro e o "tick" do
-celular (que rodam várias vezes por segundo) não geram log, de propósito,
-pra manter isso leve. Não tem upload de imagem pro botão — o botão do
-celular é sempre o texto grande "SEGURE PARA CANTAR".
+- **Senha padrão: `123456`**. Troca ela assim que entrar pela primeira vez,
+  na seção "Trocar senha do admin" — não precisa mexer em nada no Neon ou no
+  Render pra isso, fica salvo no banco.
+- Mostra contadores em tempo real: acessos totais, salas criadas, salas
+  ativas agora, pássaros cadastrados agora e quantos celulares estão
+  conectados neste exato momento (atualiza sozinho a cada 5s).
+- Deixa trocar a imagem do botão "SEGURE PARA CANTAR" da tela do celular por
+  uma foto sua. A imagem é redimensionada e comprimida automaticamente no
+  seu navegador antes de enviar (fica leve, não pesa no app). Dá pra voltar
+  pro botão padrão a qualquer momento.
+- A sessão do admin dura 12h; clica em "Sair" se estiver usando um
+  computador compartilhado.
+
+## O que mudou nesta versão
+
+- **Contadores reais** (acessos, salas criadas, salas ativas, celulares
+  conectados) — visíveis em `/admin`.
+- **Tela do celular redesenhada** (visual mais limpo, indicador de conexão
+  com pulso, relógio com mais destaque) e possibilidade de colocar uma
+  **imagem personalizada no botão** de marcar, configurável em `/admin`.
+- **Delay reduzido entre celular e organizador**: o celular só grava um novo
+  tempo no banco enquanto está realmente contando (antes gravava a cada
+  100ms mesmo parado); a tela do organizador atualiza a cada 400ms em vez de
+  1s; e o pool de conexões com o banco dobrou de tamanho. Se mesmo assim o
+  delay incomodar com muitos celulares ao mesmo tempo, vale aumentar
+  `--threads` no Start Command do Render (ex: de 8 pra 16).
+- **Milissegundos no cronômetro grande** da Eliminatória/Final (organizador),
+  além de minutos e segundos — atualiza suavemente sem precisar bater no
+  servidor a cada 100ms (calcula localmente entre uma sincronização e outra).
+- **Bug corrigido**: na tela de vínculo do celular, a lista de pássaros de
+  uma categoria (Eliminatória ou Final) some assim que aquela prova é
+  finalizada — antes as duas listas ficavam aparecendo juntas mesmo depois
+  da Eliminatória já ter acabado.
 
 ## Estrutura
 
-- `app.py` — servidor Flask (rotas da API + as 3 telas embutidas em HTML).
+- `app.py` — servidor Flask (rotas da API + as 4 telas embutidas em HTML:
+  home, organizador, celular e admin).
 - `db.py` — camada de banco de dados (Neon/Postgres): tabelas, consultas,
-  finalização automática por tempo, limpeza de salas com mais de 48h.
+  finalização automática por tempo, limpeza de salas com mais de 48h,
+  config (senha do admin / imagem do botão) e estatísticas.
 - `requirements.txt` — dependências (Flask, gunicorn, psycopg2).
 
 ## Nota sobre o que testei

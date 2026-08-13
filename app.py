@@ -3,12 +3,15 @@ import time
 import random
 import string
 import threading
+from functools import wraps
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 
 import db
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
+app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 12  # 12h de sessão pro admin
 
 # ════════════════════════════════════════════════════════════════════
 # ESTADO EFÊMERO (só isso continua em memória — não precisa sobreviver
@@ -38,43 +41,6 @@ def novo_codigo_sala():
 
 
 # ════════════════════════════════════════════════════════════════════
-# API — ADMIN (painel separado em /admin — sem imagem, só estatísticas,
-# logs e troca de senha; ver db.registrar_acesso pra como o log é gravado
-# sem pesar nas rotas do celular/organizador)
-# ════════════════════════════════════════════════════════════════════
-
-@app.route('/api/admin/estatisticas')
-def api_admin_estatisticas():
-    senha = request.headers.get('X-Admin-Password', '')
-    if not db.verificar_senha_admin(senha):
-        return jsonify({"ok": False, "erro": "senha inválida"}), 401
-    stats = db.obter_estatisticas()
-    stats['ok'] = True
-    return jsonify(stats)
-
-
-@app.route('/api/admin/logs')
-def api_admin_logs():
-    senha = request.headers.get('X-Admin-Password', '')
-    if not db.verificar_senha_admin(senha):
-        return jsonify({"ok": False, "erro": "senha inválida"}), 401
-    limite = request.args.get('limite', 50, type=int)
-    return jsonify({"ok": True, "logs": db.obter_logs_recentes(limite)})
-
-
-@app.route('/api/admin/senha', methods=['POST'])
-def api_admin_alterar_senha():
-    dados = request.get_json(force=True) or {}
-    senha_antiga = dados.get('senha_antiga', '')
-    senha_nova = dados.get('senha_nova', '')
-    if not senha_nova or len(senha_nova) < 4:
-        return jsonify({"ok": False, "erro": "senha nova deve ter pelo menos 4 caracteres"}), 400
-    if db.alterar_senha_admin(senha_antiga, senha_nova):
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "erro": "senha antiga incorreta"}), 401
-
-
-# ════════════════════════════════════════════════════════════════════
 # API — SALA
 # ════════════════════════════════════════════════════════════════════
 
@@ -82,7 +48,10 @@ def api_admin_alterar_senha():
 def api_criar_sala():
     codigo = novo_codigo_sala()
     db.criar_sala(codigo)
-    db.registrar_acesso(codigo, 'api', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
+    try:
+        db.incrementar_salas_criadas()
+    except Exception:
+        pass
     return jsonify({"ok": True, "codigo": codigo})
 
 
@@ -106,7 +75,6 @@ def api_cadastrar_prova(codigo):
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False, "erro": "tipo inválido"}), 400
     db.cadastrar_prova(codigo, tipo, passaros)
-    db.registrar_acesso(codigo, 'organizador', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -156,7 +124,6 @@ def api_iniciar_prova(codigo, tipo):
     restante_txt = db.formatar_tempo(resultado['duracao'])
     for esp32_id in resultado['vinculados']:
         empurrar_comandos(esp32_id, [f"PROVA:{restante_txt}"])
-    db.registrar_acesso(codigo, 'organizador', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -168,7 +135,6 @@ def api_finalizar_prova(codigo, tipo):
     vinculados = db.finalizar_prova(codigo, tipo)
     for esp32_id in vinculados:
         empurrar_comandos(esp32_id, ["FINALIZAR"])
-    db.registrar_acesso(codigo, 'organizador', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -180,7 +146,6 @@ def api_limpar_prova(codigo, tipo):
     vinculados = db.limpar_prova(codigo, tipo)
     for esp32_id in vinculados:
         empurrar_comandos(esp32_id, ["RESET"])
-    db.registrar_acesso(codigo, 'organizador', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -200,7 +165,6 @@ def api_classificar(codigo):
         qtd = db.obter_quantidade_classificados(codigo)
     qtd = max(0, qtd)
     total = db.classificar(codigo, qtd)
-    db.registrar_acesso(codigo, 'organizador', ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True, "classificados": total})
 
 
@@ -239,7 +203,6 @@ def api_vincular(codigo):
 
     with conexoes_lock:
         conexoes[esp32_id] = {"fila_saida": list(resultado['comandos']), "ultimo_tick": time.time()}
-    db.registrar_acesso(codigo, 'celular', esp32_id=esp32_id, ip=request.remote_addr, user_agent=request.headers.get('User-Agent'))
     return jsonify({"ok": True})
 
 
@@ -294,6 +257,107 @@ def api_ranking_geral(codigo):
         return jsonify({"ok": False}), 404
     ranking = db.ranking_geral(codigo)
     return jsonify({"ok": True, "ranking": ranking})
+
+
+@app.route('/api/sala/<codigo>/status_provas')
+def api_status_provas(codigo):
+    codigo = codigo.upper()
+    if not db.sala_existe(codigo):
+        return jsonify({"ok": False}), 404
+    return jsonify({"ok": True, "status": db.status_provas(codigo)})
+
+
+# ════════════════════════════════════════════════════════════════════
+# API — CONFIG PÚBLICA (imagem do botão do celular, lida sem senha)
+# ════════════════════════════════════════════════════════════════════
+
+@app.route('/api/config/publico')
+def api_config_publico():
+    try:
+        imagem = db.obter_config('imagem_botao')
+    except Exception:
+        imagem = None
+    return jsonify({"ok": True, "imagem_botao": imagem})
+
+
+# ════════════════════════════════════════════════════════════════════
+# API — ADMIN (senha própria, separada do código de sala)
+# ════════════════════════════════════════════════════════════════════
+
+def admin_necessario(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get('admin_ok'):
+            return jsonify({"ok": False, "erro": "não autenticado"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route('/api/admin/status')
+def api_admin_status():
+    return jsonify({"ok": True, "autenticado": bool(session.get('admin_ok'))})
+
+
+@app.route('/api/admin/login', methods=['POST'])
+def api_admin_login():
+    dados = request.get_json(force=True) or {}
+    senha = dados.get('senha', '')
+    try:
+        valido = db.verificar_senha_admin(senha)
+    except Exception:
+        return jsonify({"ok": False, "erro": "banco de dados indisponível"}), 503
+    if not valido:
+        return jsonify({"ok": False, "erro": "senha incorreta"}), 401
+    session.permanent = True
+    session['admin_ok'] = True
+    return jsonify({"ok": True})
+
+
+@app.route('/api/admin/logout', methods=['POST'])
+def api_admin_logout():
+    session.pop('admin_ok', None)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/admin/stats')
+@admin_necessario
+def api_admin_stats():
+    stats = db.obter_estatisticas_gerais()
+    agora = time.time()
+    with conexoes_lock:
+        dispositivos_conectados_agora = sum(
+            1 for c in conexoes.values() if agora - c['ultimo_tick'] <= 10
+        )
+    stats['dispositivos_conectados_agora'] = dispositivos_conectados_agora
+    return jsonify({"ok": True, "stats": stats})
+
+
+@app.route('/api/admin/trocar_senha', methods=['POST'])
+@admin_necessario
+def api_admin_trocar_senha():
+    dados = request.get_json(force=True) or {}
+    atual = dados.get('senha_atual', '')
+    nova = dados.get('nova_senha', '')
+    if not db.verificar_senha_admin(atual):
+        return jsonify({"ok": False, "erro": "senha atual incorreta"}), 401
+    if len(nova) < 4:
+        return jsonify({"ok": False, "erro": "a nova senha precisa ter pelo menos 4 caracteres"}), 400
+    db.trocar_senha_admin(nova)
+    return jsonify({"ok": True})
+
+
+@app.route('/api/admin/imagem_botao', methods=['POST'])
+@admin_necessario
+def api_admin_imagem_botao():
+    dados = request.get_json(force=True) or {}
+    imagem = dados.get('imagem')
+    if imagem:
+        if not isinstance(imagem, str) or not imagem.startswith('data:image/'):
+            return jsonify({"ok": False, "erro": "imagem inválida"}), 400
+        if len(imagem) > 700_000:
+            return jsonify({"ok": False, "erro": "imagem muito grande (tenta uma foto menor)"}), 400
+    db.definir_config('imagem_botao', imagem)
+    return jsonify({"ok": True})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -432,6 +496,10 @@ function entrarComoCelular() {
 
 @app.route('/')
 def tela_home():
+    try:
+        db.incrementar_acesso()
+    except Exception:
+        pass
     return HTML_HOME
 
 
@@ -444,7 +512,7 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <style>""" + ESTILO_BASE + """
 .faixa-codigo { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
 .relogio { text-align:center; margin:6px 0 16px; }
-.relogio-numero { font-family:monospace; font-size:52px; color:#F0C030; font-weight:bold; letter-spacing:2px; }
+.relogio-numero { font-family:monospace; font-size:44px; color:#F0C030; font-weight:bold; letter-spacing:1px; }
 .relogio-legenda { color:#93a4c3; font-size:12px; }
 .relogio.acabando .relogio-numero { color:#B0271A; }
 .aviso-offline { background:#4a1414; border:1px solid #B0271A; color:#ffd0cc; padding:10px 12px;
@@ -460,9 +528,6 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
       <div class="sub">sala <span class="codigo-sala" id="codigoTopo">------</span></div>
     </div>
     <button class="btn-roxo" onclick="copiarLinkCelular()">📟 Link do celular</button>
-  </div>
-  <div style="text-align:right; margin:-8px 0 8px;">
-    <a href="/admin" style="color:#5a6d94; font-size:12px; text-decoration:none;">⚙️ Admin</a>
   </div>
 
   <div class="aviso-offline" id="avisoOffline">
@@ -501,7 +566,7 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
     <h2 style="margin-top:0" id="tituloProva">Eliminatória</h2>
 
     <div class="relogio" id="blocoRelogio" style="display:none">
-      <div class="relogio-numero" id="relogioNumero">00:00</div>
+      <div class="relogio-numero" id="relogioNumero">00:00:000</div>
       <div class="relogio-legenda" id="relogioLegenda">tempo restante da prova</div>
     </div>
 
@@ -683,12 +748,21 @@ async function adicionarTodosAProva() {
 }
 
 // ═══════ PROVA (Eliminatória / Final) ═══════
-function formatarMMSS(segundos) {
-  segundos = Math.max(0, Math.round(segundos));
-  const mm = String(Math.floor(segundos / 60)).padStart(2, '0');
-  const ss = String(segundos % 60).padStart(2, '0');
-  return `${mm}:${ss}`;
+function formatarMMSSmmm(segundos) {
+  if (segundos < 0) segundos = 0;
+  const totalMs = Math.round(segundos * 1000);
+  const mm = String(Math.floor(totalMs / 60000)).padStart(2, '0');
+  const ss = String(Math.floor((totalMs % 60000) / 1000)).padStart(2, '0');
+  const mmm = String(totalMs % 1000).padStart(3, '0');
+  return `${mm}:${ss}:${mmm}`;
 }
+
+// pra mostrar os milissegundos correndo suavemente sem precisar bater no
+// servidor toda hora, guardamos o último valor sincronizado + o instante em
+// que chegou, e interpolamos localmente entre uma sincronização e outra.
+let relogioSyncSegundos = 0;
+let relogioSyncEm = 0;
+let relogioAtivo = false;
 
 async function atualizarProva() {
   if (telaAtual !== 'eliminatorias' && telaAtual !== 'final') return;
@@ -702,15 +776,17 @@ async function atualizarProva() {
     document.getElementById('statusProva').textContent = `${data.itens.length} pássaro(s) — prova ${status}`;
 
     const blocoRelogio = document.getElementById('blocoRelogio');
+    relogioAtivo = data.ativa;
+    relogioSyncSegundos = data.tempo_restante;
+    relogioSyncEm = Date.now();
     if (data.ativa) {
       blocoRelogio.style.display = 'block';
       blocoRelogio.classList.toggle('acabando', data.tempo_restante <= 30);
-      document.getElementById('relogioNumero').textContent = formatarMMSS(data.tempo_restante);
       document.getElementById('relogioLegenda').textContent = 'tempo restante da prova (finaliza sozinho)';
     } else if (data.finalizada) {
       blocoRelogio.style.display = 'block';
       blocoRelogio.classList.remove('acabando');
-      document.getElementById('relogioNumero').textContent = '00:00';
+      document.getElementById('relogioNumero').textContent = '00:00:000';
       document.getElementById('relogioLegenda').textContent = 'prova finalizada';
     } else {
       blocoRelogio.style.display = 'none';
@@ -905,7 +981,15 @@ async function sincronizarFundo() {
 
 setInterval(() => {
   if (telaAtual === 'eliminatorias' || telaAtual === 'final') atualizarProva();
-}, 1000);
+}, 400);
+// interpolação local do relógio grande — atualiza a cada 100ms (com
+// milissegundos) sem precisar bater no servidor a essa frequência
+setInterval(() => {
+  if ((telaAtual !== 'eliminatorias' && telaAtual !== 'final') || !relogioAtivo) return;
+  const decorrido = (Date.now() - relogioSyncEm) / 1000;
+  const restante = Math.max(0, relogioSyncSegundos - decorrido);
+  document.getElementById('relogioNumero').textContent = formatarMMSSmmm(restante);
+}, 100);
 setInterval(sincronizarFundo, 2000);
 
 mostrarTela('cadastro');
@@ -916,6 +1000,10 @@ mostrarTela('cadastro');
 
 @app.route('/organizador/<codigo>')
 def tela_organizador(codigo):
+    try:
+        db.incrementar_acesso()
+    except Exception:
+        pass
     return HTML_ORGANIZADOR
 
 
@@ -927,17 +1015,30 @@ HTML_CELULAR = """<!DOCTYPE html>
 <title>Celular como ESP32</title>
 <style>""" + ESTILO_BASE + """
   body { user-select:none; }
-  .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:14px 0 8px; }
-  .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444; }
-  .bolinha.ok { background:#10b981; }
-  .lcd { background:#000; border-radius:14px; padding:18px 12px; margin-bottom:22px; border:3px solid #223; }
-  .lcd-linha0 { color:#F0C030; font-family:monospace; font-size:20px; text-align:center;
-                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:34px; text-align:center; margin-top:6px; letter-spacing:1px; }
-  .botao-canto { width:100%; padding:60px 0; border-radius:24px; border:none; font-weight:bold; font-size:20px;
-                 color:white; background:#1558B0; box-shadow:0 4px 0 #0d3a7c; touch-action:none; }
-  .botao-canto.pressionado { background:#177A38; box-shadow:0 2px 0 #0d3a7c; transform:translateY(2px); }
-  .botao-canto:disabled { background:#374158; box-shadow:0 4px 0 #232a3a; color:#7c88a6; }
+  .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:16px 0 8px;
+                display:flex; align-items:center; gap:6px; letter-spacing:.03em; }
+  .cat-titulo .risco { flex:1; height:1px; background:linear-gradient(90deg,#F0C03055,transparent); }
+  .cat-encerrada { color:#7c88a6; font-size:13px; margin:10px 0 4px; font-style:italic; }
+  .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444;
+             box-shadow:0 0 6px #ef4444; transition:background .3s, box-shadow .3s; }
+  .bolinha.ok { background:#10b981; box-shadow:0 0 6px #10b981aa; animation:pulso 1.6s infinite; }
+  @keyframes pulso { 0%,100%{opacity:1;} 50%{opacity:.55;} }
+  .lcd { background:linear-gradient(180deg,#0a0f1c,#050810); border-radius:16px; padding:20px 14px; margin-bottom:22px;
+         border:1px solid #263049; box-shadow:inset 0 2px 10px #000a, 0 6px 18px -6px #000a; }
+  .lcd-linha0 { color:#F0C030; font-family:'Courier New',monospace; font-size:19px; text-align:center;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:0 0 8px #F0C03066; }
+  .lcd-linha1 { color:#3ddc84; font-family:'Courier New',monospace; font-size:36px; text-align:center; margin-top:8px;
+                letter-spacing:1px; text-shadow:0 0 12px #3ddc8477; }
+  .botao-canto { width:100%; padding:64px 0; border-radius:26px; border:none; font-weight:800; font-size:19px;
+                 letter-spacing:.02em; color:white; background:linear-gradient(180deg,#2E6FE0,#1558B0);
+                 box-shadow:0 5px 0 #0d3a7c, 0 8px 16px -4px #0007; touch-action:none; position:relative;
+                 overflow:hidden; background-size:cover; background-position:center; transition:filter .1s, transform .05s; }
+  .botao-canto.tem-imagem { color:white; text-shadow:0 1px 6px #000, 0 0 3px #000; }
+  .botao-canto.tem-imagem::before { content:""; position:absolute; inset:0;
+        background:linear-gradient(180deg, transparent 40%, #000000aa 100%); }
+  .botao-canto span.rotulo { position:relative; z-index:1; }
+  .botao-canto.pressionado { filter:brightness(.72); box-shadow:0 2px 0 #0d3a7c; transform:translateY(3px); }
+  .botao-canto:disabled { background:#374158; box-shadow:0 4px 0 #232a3a; color:#7c88a6; filter:none; }
 </style>
 </head>
 <body>
@@ -947,10 +1048,14 @@ HTML_CELULAR = """<!DOCTYPE html>
   <div class="sub"><span class="bolinha" id="bolinhaStatus"></span><span id="textoStatus">conectando...</span></div>
 
   <div id="telaVincular">
-    <div class="cat-titulo">🔵 ELIMINATÓRIA</div>
-    <div id="listaElim"><div class="vazio">carregando...</div></div>
-    <div class="cat-titulo">🔴 FINAL</div>
-    <div id="listaFinal"><div class="vazio">carregando...</div></div>
+    <div id="blocoElim">
+      <div class="cat-titulo">🔵 ELIMINATÓRIA<span class="risco"></span></div>
+      <div id="listaElim"><div class="vazio">carregando...</div></div>
+    </div>
+    <div id="blocoFinal">
+      <div class="cat-titulo">🔴 FINAL<span class="risco"></span></div>
+      <div id="listaFinal"><div class="vazio">carregando...</div></div>
+    </div>
   </div>
 
   <div id="telaMarcador" style="display:none">
@@ -958,7 +1063,7 @@ HTML_CELULAR = """<!DOCTYPE html>
       <div class="lcd-linha0" id="lcdLinha0">-</div>
       <div class="lcd-linha1" id="lcdLinha1">00:00:000</div>
     </div>
-    <button class="botao-canto" id="botaoCanto">AGUARDANDO INÍCIO DA PROVA</button>
+    <button class="botao-canto" id="botaoCanto"><span class="rotulo">AGUARDANDO INÍCIO DA PROVA</span></button>
     <div class="linha-botoes">
       <button class="btn-roxo" onclick="trocarPassaro()" style="width:100%">🔄 Trocar pássaro vinculado</button>
     </div>
@@ -1068,8 +1173,26 @@ function parseTempoParaMs(str) {
 function atualizarBotao() {
   const btn = document.getElementById('botaoCanto');
   btn.disabled = botaoBloqueado;
-  btn.textContent = botaoBloqueado ? 'AGUARDANDO INÍCIO DA PROVA' : 'SEGURE PARA CANTAR';
+  btn.querySelector('.rotulo').textContent = botaoBloqueado ? 'AGUARDANDO INÍCIO DA PROVA' : 'SEGURE PARA CANTAR';
 }
+
+// imagem personalizada de fundo do botão (configurada em /admin) — busca uma
+// vez só no início, é leve e não pesa no funcionamento do app
+async function aplicarImagemBotao() {
+  try {
+    const resp = await fetch('/api/config/publico');
+    const data = await resp.json();
+    const btn = document.getElementById('botaoCanto');
+    if (data.ok && data.imagem_botao) {
+      btn.style.backgroundImage = `url("${data.imagem_botao}")`;
+      btn.classList.add('tem-imagem');
+    } else {
+      btn.style.backgroundImage = '';
+      btn.classList.remove('tem-imagem');
+    }
+  } catch (e) {}
+}
+aplicarImagemBotao();
 
 const botaoEl = document.getElementById('botaoCanto');
 function iniciarCanto(ev) {
@@ -1083,6 +1206,7 @@ function pararCanto(ev) {
   if (!isRunning) return;
   isRunning = false;
   totalTime += Date.now() - startTime;
+  enviarValorFinalPendente = true;   // manda o valor congelado pro servidor uma última vez
   botaoEl.classList.remove('pressionado');
 }
 botaoEl.addEventListener('pointerdown', iniciarCanto);
@@ -1091,6 +1215,7 @@ botaoEl.addEventListener('pointercancel', pararCanto);
 botaoEl.addEventListener('pointerleave', pararCanto);
 
 let tickEmAndamento = false;
+let enviarValorFinalPendente = false;
 setInterval(() => {
   let displayTime = totalTime;
   if (isRunning) displayTime += Date.now() - startTime;
@@ -1104,18 +1229,35 @@ setInterval(() => {
     document.getElementById('lcdLinha0').textContent = 'PROVA ' + formatarTempo(restante);
   }
 
-  if (!tickEmAndamento) {
+  // só grava no banco enquanto está contando (ou uma última vez ao soltar);
+  // parado, não tem motivo pra reescrever o mesmo valor 10x por segundo —
+  // isso reduz bastante o atraso entre o celular e a tela do organizador
+  if (!tickEmAndamento && (isRunning || enviarValorFinalPendente)) {
     tickEmAndamento = true;
+    enviarValorFinalPendente = false;
     enviarTick(provaIniciada ? bufLocal : '').finally(() => { tickEmAndamento = false; });
   }
 }, 100);
 
 async function carregarPassaros() {
   try {
-    const [elim, final] = await Promise.all([
+    const [elim, final, statusResp] = await Promise.all([
       fetch(`/api/sala/${codigo}/passaros_livres/eliminatorias`).then(r => r.json()),
       fetch(`/api/sala/${codigo}/passaros_livres/final`).then(r => r.json()),
+      fetch(`/api/sala/${codigo}/status_provas`).then(r => r.json()),
     ]);
+    const status = statusResp.ok ? statusResp.status : {};
+    // corrige o bug de aparecer a lista da eliminatória junto com a da final:
+    // uma vez que a prova acabou (finalizada), ela some da tela de vínculo —
+    // só continua aparecendo a categoria que ainda está aberta pra vincular
+    const elimFinalizada = !!(status.eliminatorias && status.eliminatorias.finalizada);
+    const finalFinalizada = !!(status.final && status.final.finalizada);
+
+    const blocoElim = document.getElementById('blocoElim');
+    const blocoFinal = document.getElementById('blocoFinal');
+    blocoElim.style.display = elimFinalizada ? 'none' : '';
+    blocoFinal.style.display = finalFinalizada ? 'none' : '';
+
     montarLista('listaElim', elim.ok ? elim.itens : [], 'eliminatorias');
     montarLista('listaFinal', final.ok ? final.itens : [], 'final');
   } catch (e) {}
@@ -1230,216 +1372,251 @@ setInterval(carregarPassaros, 5000);
 
 @app.route('/celular/<codigo>')
 def tela_celular(codigo):
+    try:
+        db.incrementar_acesso()
+    except Exception:
+        pass
     return HTML_CELULAR
 
-
-# ════════════════════════════════════════════════════════════════════
-# TELA ADMIN — separada de tudo (só carrega quando alguém abre /admin;
-# não afeta o organizador nem o celular em nada). Sem upload de imagem.
-# ════════════════════════════════════════════════════════════════════
 
 HTML_ADMIN = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Admin - Marcador Digital Goularth</title>
+<title>Admin — Marcador Digital Goularth</title>
 <style>""" + ESTILO_BASE + """
-.estatistica-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-top:10px; }
-.estatistica-item { background:#0f1830; border-radius:8px; padding:14px; text-align:center; border:1px solid #1a2a4a; }
-.estatistica-item .valor { font-size:32px; font-weight:bold; color:#F0C030; }
-.estatistica-item .label { font-size:11px; color:#93a4c3; margin-top:4px; }
-.log-tabela { font-size:12px; }
-.log-tabela td { padding:4px 6px; font-size:11px; }
-.log-tabela .timestamp { color:#5a6d94; white-space:nowrap; }
+  .stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+  .stat-box { background:#0f1830; border-radius:10px; padding:14px; text-align:center; }
+  .stat-num { font-size:26px; font-weight:bold; color:#F0C030; font-family:monospace; }
+  .stat-label { font-size:11px; color:#93a4c3; margin-top:4px; }
+  .preview-botao { width:100%; padding:40px 0; border-radius:20px; text-align:center; color:white;
+                    font-weight:bold; background:#1558B0; background-size:cover; background-position:center;
+                    margin:10px 0; position:relative; }
+  .preview-botao span { position:relative; z-index:1; text-shadow:0 1px 6px #000; }
+  .preview-botao.tem-imagem::before { content:""; position:absolute; inset:0; border-radius:20px;
+        background:linear-gradient(180deg, transparent 40%, #000000aa 100%); }
+  .erro-msg { color:#ff6b6b; font-size:13px; margin-top:6px; display:none; }
+  .ok-msg { color:#3ddc84; font-size:13px; margin-top:6px; display:none; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="faixa-codigo">
-    <div>
-      <h1>⚙️ Painel Admin</h1>
-      <div class="sub">Estatísticas do sistema</div>
-    </div>
-    <a href="/" class="btn-cinza" style="text-decoration:none; padding:8px 12px; border-radius:8px;">← Voltar</a>
-  </div>
+  <h1>🔐 Painel do administrador</h1>
+  <div class="sub">contadores da plataforma e imagem do botão do celular</div>
 
   <div id="telaLogin" class="card">
-    <h2 style="margin-top:0">🔐 Acesso Restrito</h2>
-    <div class="sub">Digite a senha para acessar o painel administrativo</div>
-    <input type="password" id="senhaLogin" placeholder="Senha" style="margin-bottom:8px;">
-    <button class="btn-ouro" onclick="fazerLogin()" style="width:100%">Entrar</button>
-    <div id="erroLogin" style="color:#B0271A; margin-top:8px; display:none;">Senha incorreta!</div>
+    <h2 style="margin-top:0">Entrar</h2>
+    <input type="text" id="campoSenha" placeholder="Senha do admin" style="letter-spacing:2px">
+    <button class="btn-ouro" onclick="entrar()" style="width:100%">Entrar</button>
+    <div class="erro-msg" id="loginErro"></div>
   </div>
 
-  <div id="telaAdmin" style="display:none;">
+  <div id="telaPainel" style="display:none">
     <div class="card">
-      <h2 style="margin-top:0">📊 Estatísticas em Tempo Real</h2>
-      <div class="estatistica-grid" id="gridStats">
-        <div class="estatistica-item"><div class="valor" id="statSalas">-</div><div class="label">Total de Salas</div></div>
-        <div class="estatistica-item"><div class="valor" id="statSalasAtivas">-</div><div class="label">Salas Ativas (24h)</div></div>
-        <div class="estatistica-item"><div class="valor" id="statAcessos">-</div><div class="label">Total de Acessos</div></div>
-        <div class="estatistica-item"><div class="valor" id="statAcessos24h">-</div><div class="label">Acessos (24h)</div></div>
-        <div class="estatistica-item"><div class="valor" id="statDispositivos">-</div><div class="label">Dispositivos Únicos</div></div>
-        <div class="estatistica-item"><div class="valor" id="statVinculados">-</div><div class="label">Vinculados Agora</div></div>
-        <div class="estatistica-item"><div class="valor" id="statProvas">-</div><div class="label">Provas em Andamento</div></div>
-        <div class="estatistica-item"><div class="valor" id="statPassaros">-</div><div class="label">Total de Pássaros</div></div>
+      <h2 style="margin-top:0">📊 Dados em tempo real</h2>
+      <div class="stat-grid" id="statGrid">
+        <div class="vazio">carregando...</div>
       </div>
+      <div class="sub" style="margin-top:10px">atualiza a cada 5 segundos</div>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">🖼️ Imagem do botão do celular</h2>
+      <div class="sub">Substitui o botão azul "SEGURE PARA CANTAR" por uma imagem sua. A imagem é redimensionada automaticamente pra ficar leve e não atrapalhar o app.</div>
+      <div class="preview-botao" id="previewBotao"><span>SEGURE PARA CANTAR</span></div>
+      <input type="file" id="arquivoImagem" accept="image/*" style="margin-bottom:8px">
       <div class="linha-botoes">
-        <button class="btn-azul" onclick="atualizarEstatisticas()" style="flex:1">🔄 Atualizar</button>
+        <button class="btn-azul" onclick="enviarImagem()">💾 Salvar imagem</button>
+        <button class="btn-cinza" onclick="removerImagem()">↩️ Usar botão padrão</button>
       </div>
+      <div class="erro-msg" id="imagemErro"></div>
+      <div class="ok-msg" id="imagemOk"></div>
     </div>
 
     <div class="card">
-      <h2 style="margin-top:0">🏆 Salas Mais Acessadas</h2>
-      <table id="tabelaTopSalas">
-        <thead><tr><th>Código</th><th>Acessos</th><th>Último Uso</th></tr></thead>
-        <tbody><tr><td class="vazio" colspan="3">carregando...</td></tr></tbody>
-      </table>
+      <h2 style="margin-top:0">🔑 Trocar senha do admin</h2>
+      <input type="password" id="senhaAtual" placeholder="Senha atual">
+      <input type="password" id="senhaNova" placeholder="Nova senha (mín. 4 caracteres)">
+      <button class="btn-roxo" onclick="trocarSenha()" style="width:100%">Trocar senha</button>
+      <div class="erro-msg" id="senhaErro"></div>
+      <div class="ok-msg" id="senhaOk"></div>
     </div>
 
-    <div class="card">
-      <h2 style="margin-top:0">🔑 Alterar Senha Admin</h2>
-      <input type="password" id="senhaAntiga" placeholder="Senha atual">
-      <input type="password" id="senhaNova" placeholder="Nova senha (mínimo 4 caracteres)">
-      <div class="linha-botoes">
-        <button class="btn-ouro" onclick="alterarSenha()">Alterar Senha</button>
-      </div>
-      <div id="msgSenha" style="margin-top:6px; font-size:13px;"></div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin-top:0">📋 Logs Recentes</h2>
-      <div class="sub">Últimos 50 acessos (cadastro, iniciar/finalizar prova, vincular celular — pra não pesar, o tick do celular e o polling do cronômetro não são logados aqui)</div>
-      <table class="log-tabela" id="tabelaLogs">
-        <thead><tr><th>Data/Hora</th><th>Sala</th><th>Tipo</th><th>Dispositivo</th></tr></thead>
-        <tbody><tr><td class="vazio" colspan="4">carregando...</td></tr></tbody>
-      </table>
-    </div>
+    <button class="btn-cinza" onclick="sair()" style="width:100%">Sair</button>
   </div>
 </div>
-
 <script>
-let token = '';
-
-function fazerLogin() {
-  const senha = document.getElementById('senhaLogin').value;
-  if (!senha) return;
-  fetch('/api/admin/estatisticas', { headers: { 'X-Admin-Password': senha } })
-    .then(r => r.json())
-    .then(data => {
-      if (data.ok) {
-        token = senha;
-        localStorage.setItem('admin_token', senha);
-        document.getElementById('telaLogin').style.display = 'none';
-        document.getElementById('telaAdmin').style.display = 'block';
-        document.getElementById('erroLogin').style.display = 'none';
-        carregarTudo();
-      } else {
-        document.getElementById('erroLogin').style.display = 'block';
-      }
-    })
-    .catch(() => { document.getElementById('erroLogin').style.display = 'block'; });
+function mostrar(id, msg, cor) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.style.display = msg ? 'block' : 'none';
 }
 
-function getHeaders() { return { 'X-Admin-Password': token }; }
-
-async function carregarTudo() {
-  await atualizarEstatisticas();
-  await carregarLogs();
-}
-
-async function atualizarEstatisticas() {
+async function verificarStatus() {
   try {
-    const resp = await fetch('/api/admin/estatisticas', { headers: getHeaders() });
+    const resp = await fetch('/api/admin/status');
     const data = await resp.json();
-    if (!data.ok) return;
-    document.getElementById('statSalas').textContent = data.total_salas;
-    document.getElementById('statSalasAtivas').textContent = data.salas_ativas_24h;
-    document.getElementById('statAcessos').textContent = data.total_acessos;
-    document.getElementById('statAcessos24h').textContent = data.acessos_24h;
-    document.getElementById('statDispositivos').textContent = data.dispositivos_unicos_24h;
-    document.getElementById('statVinculados').textContent = data.vinculados_agora;
-    document.getElementById('statProvas').textContent = data.provas_ativas;
-    document.getElementById('statPassaros').textContent = data.total_passaros;
-
-    const tbody = document.querySelector('#tabelaTopSalas tbody');
-    if (data.salas_top && data.salas_top.length > 0) {
-      tbody.innerHTML = '';
-      data.salas_top.forEach(s => {
-        const tr = document.createElement('tr');
-        const ultimo = new Date(s.ultimo_uso).toLocaleString('pt-BR');
-        tr.innerHTML = `<td><strong style="color:#F0C030;">${s.codigo}</strong></td><td>${s.acessos_total}</td><td>${ultimo}</td>`;
-        tbody.appendChild(tr);
-      });
-    } else {
-      tbody.innerHTML = '<tr><td class="vazio" colspan="3">nenhuma sala com acessos</td></tr>';
+    if (data.ok && data.autenticado) {
+      document.getElementById('telaLogin').style.display = 'none';
+      document.getElementById('telaPainel').style.display = 'block';
+      carregarStats();
+      carregarImagemAtual();
     }
-  } catch (e) { console.error('Erro ao carregar estatísticas:', e); }
+  } catch (e) {}
 }
 
-async function carregarLogs() {
+async function entrar() {
+  mostrar('loginErro', '');
+  const senha = document.getElementById('campoSenha').value;
   try {
-    const resp = await fetch('/api/admin/logs', { headers: getHeaders() });
-    const data = await resp.json();
-    if (!data.ok) return;
-    const tbody = document.querySelector('#tabelaLogs tbody');
-    if (data.logs && data.logs.length > 0) {
-      tbody.innerHTML = '';
-      data.logs.forEach(log => {
-        const tr = document.createElement('tr');
-        const dataHora = new Date(log.data_hora).toLocaleString('pt-BR');
-        tr.innerHTML = `<td class="timestamp">${dataHora}</td>
-          <td><span style="color:#F0C030;">${log.sala_codigo || '-'}</span></td>
-          <td><span class="tag ${log.tipo_acesso === 'organizador' || log.tipo_acesso === 'celular' ? 'tag-ok' : 'tag-nao'}">${log.tipo_acesso}</span></td>
-          <td style="font-size:10px; font-family:monospace;">${log.esp32_id || log.ip || '-'}</td>`;
-        tbody.appendChild(tr);
-      });
-    } else {
-      tbody.innerHTML = '<tr><td class="vazio" colspan="4">nenhum log registrado</td></tr>';
-    }
-  } catch (e) { console.error('Erro ao carregar logs:', e); }
-}
-
-async function alterarSenha() {
-  const senhaAntiga = document.getElementById('senhaAntiga').value;
-  const senhaNova = document.getElementById('senhaNova').value;
-  const msgEl = document.getElementById('msgSenha');
-  if (!senhaNova || senhaNova.length < 4) {
-    msgEl.style.color = '#B0271A';
-    msgEl.textContent = '❌ A nova senha deve ter pelo menos 4 caracteres.';
-    return;
-  }
-  try {
-    const resp = await fetch('/api/admin/senha', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...getHeaders() },
-      body: JSON.stringify({ senha_antiga: senhaAntiga, senha_nova: senhaNova })
+    const resp = await fetch('/api/admin/login', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({senha})
     });
     const data = await resp.json();
     if (data.ok) {
-      msgEl.style.color = '#3ddc84';
-      msgEl.textContent = '✅ Senha alterada com sucesso!';
-      token = senhaNova;
-      localStorage.setItem('admin_token', senhaNova);
-      document.getElementById('senhaAntiga').value = '';
-      document.getElementById('senhaNova').value = '';
+      document.getElementById('telaLogin').style.display = 'none';
+      document.getElementById('telaPainel').style.display = 'block';
+      carregarStats();
+      carregarImagemAtual();
     } else {
-      msgEl.style.color = '#B0271A';
-      msgEl.textContent = '❌ ' + (data.erro || 'Erro ao alterar senha.');
+      mostrar('loginErro', data.erro || 'senha incorreta');
     }
   } catch (e) {
-    msgEl.style.color = '#B0271A';
-    msgEl.textContent = '❌ Erro de rede.';
+    mostrar('loginErro', 'sem conexão com o servidor');
   }
 }
 
-setInterval(() => { if (token) atualizarEstatisticas(); }, 10000);
-
-if (localStorage.getItem('admin_token')) {
-  document.getElementById('senhaLogin').value = localStorage.getItem('admin_token');
-  fazerLogin();
+async function sair() {
+  await fetch('/api/admin/logout', {method: 'POST'});
+  location.reload();
 }
+
+const ROTULOS = {
+  total_acessos: 'acessos totais (desde sempre)',
+  total_salas_criadas: 'salas criadas (desde sempre)',
+  salas_no_banco_agora: 'salas guardadas agora',
+  salas_ativas_ultimos_15min: 'salas ativas (15 min)',
+  total_passaros_cadastrados_agora: 'pássaros cadastrados agora',
+  dispositivos_conectados_agora: 'celulares conectados agora',
+};
+
+async function carregarStats() {
+  try {
+    const resp = await fetch('/api/admin/stats');
+    if (resp.status === 401) { location.reload(); return; }
+    const data = await resp.json();
+    if (!data.ok) return;
+    const grid = document.getElementById('statGrid');
+    grid.innerHTML = '';
+    Object.keys(ROTULOS).forEach(chave => {
+      const valor = data.stats[chave] ?? 0;
+      const box = document.createElement('div');
+      box.className = 'stat-box';
+      box.innerHTML = `<div class="stat-num">${valor}</div><div class="stat-label">${ROTULOS[chave]}</div>`;
+      grid.appendChild(box);
+    });
+  } catch (e) {}
+}
+
+async function carregarImagemAtual() {
+  try {
+    const resp = await fetch('/api/config/publico');
+    const data = await resp.json();
+    const preview = document.getElementById('previewBotao');
+    if (data.ok && data.imagem_botao) {
+      preview.style.backgroundImage = `url("${data.imagem_botao}")`;
+      preview.classList.add('tem-imagem');
+    } else {
+      preview.style.backgroundImage = '';
+      preview.classList.remove('tem-imagem');
+    }
+  } catch (e) {}
+}
+
+// redimensiona a imagem no navegador antes de enviar, pra manter o app leve
+function redimensionarImagem(file) {
+  return new Promise((resolve, reject) => {
+    const leitor = new FileReader();
+    leitor.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxLado = 500;
+        let w = img.width, h = img.height;
+        if (w > h && w > maxLado) { h = Math.round(h * maxLado / w); w = maxLado; }
+        else if (h > maxLado) { w = Math.round(w * maxLado / h); h = maxLado; }
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.72));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    leitor.onerror = reject;
+    leitor.readAsDataURL(file);
+  });
+}
+
+async function enviarImagem() {
+  mostrar('imagemErro', ''); mostrar('imagemOk', '');
+  const arquivo = document.getElementById('arquivoImagem').files[0];
+  if (!arquivo) { mostrar('imagemErro', 'escolhe um arquivo de imagem primeiro'); return; }
+  try {
+    const dataUrl = await redimensionarImagem(arquivo);
+    const resp = await fetch('/api/admin/imagem_botao', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({imagem: dataUrl})
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      mostrar('imagemOk', 'imagem salva! já vale pros próximos celulares que abrirem a página.');
+      carregarImagemAtual();
+    } else {
+      mostrar('imagemErro', data.erro || 'erro ao salvar');
+    }
+  } catch (e) {
+    mostrar('imagemErro', 'não consegui processar essa imagem');
+  }
+}
+
+async function removerImagem() {
+  mostrar('imagemErro', ''); mostrar('imagemOk', '');
+  const resp = await fetch('/api/admin/imagem_botao', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({imagem: null})
+  });
+  const data = await resp.json();
+  if (data.ok) { mostrar('imagemOk', 'voltou pro botão padrão.'); carregarImagemAtual(); }
+}
+
+async function trocarSenha() {
+  mostrar('senhaErro', ''); mostrar('senhaOk', '');
+  const senha_atual = document.getElementById('senhaAtual').value;
+  const nova_senha = document.getElementById('senhaNova').value;
+  try {
+    const resp = await fetch('/api/admin/trocar_senha', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({senha_atual, nova_senha})
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      mostrar('senhaOk', 'senha trocada com sucesso.');
+      document.getElementById('senhaAtual').value = '';
+      document.getElementById('senhaNova').value = '';
+    } else {
+      mostrar('senhaErro', data.erro || 'erro ao trocar senha');
+    }
+  } catch (e) {
+    mostrar('senhaErro', 'sem conexão com o servidor');
+  }
+}
+
+verificarStatus();
+setInterval(() => {
+  if (document.getElementById('telaPainel').style.display !== 'none') carregarStats();
+}, 5000);
 </script>
 </body>
 </html>"""

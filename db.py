@@ -1,7 +1,5 @@
 import os
 import re
-import time
-import queue
 import threading
 import datetime
 
@@ -22,8 +20,6 @@ from psycopg2.pool import ThreadedConnectionPool
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
-ADMIN_DEFAULT_PASSWORD = "123456"
-
 _pool = None
 _pool_lock = threading.Lock()
 
@@ -38,7 +34,11 @@ def _obter_pool():
                         "DATABASE_URL não configurada. Defina essa variável de "
                         "ambiente com a connection string do Neon antes de rodar."
                     )
-                _pool = ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+                # pool maior (20) ajuda a evitar fila de espera por conexão
+                # quando várias pessoas estão marcando ao mesmo tempo — isso
+                # era uma das causas do delay entre o celular e a tela do
+                # organizador.
+                _pool = ThreadedConnectionPool(1, 20, DATABASE_URL, sslmode='require')
     return _pool
 
 
@@ -63,68 +63,6 @@ class conexao:
         return False
 
 
-# ════════════════════════════════════════════════════════════════════
-# LOG DE ACESSO — fila em memória + gravação em lote em segundo plano.
-# Assim o admin continua tendo estatísticas, mas nenhuma requisição do
-# celular/organizador espera o banco confirmar um log pra poder responder.
-# ════════════════════════════════════════════════════════════════════
-
-_log_queue = queue.Queue()
-_log_worker_iniciado = False
-_log_worker_lock = threading.Lock()
-
-
-def _iniciar_log_worker():
-    global _log_worker_iniciado
-    if _log_worker_iniciado:
-        return
-    with _log_worker_lock:
-        if _log_worker_iniciado:
-            return
-        threading.Thread(target=_log_worker, daemon=True).start()
-        _log_worker_iniciado = True
-
-
-def _log_worker():
-    while True:
-        item = _log_queue.get()
-        lote = [item]
-        while len(lote) < 200:
-            try:
-                lote.append(_log_queue.get_nowait())
-            except queue.Empty:
-                break
-        try:
-            with conexao() as cur:
-                psycopg2.extras.execute_values(
-                    cur,
-                    """INSERT INTO logs_acesso (sala_codigo, tipo_acesso, esp32_id, ip, user_agent)
-                       VALUES %s""",
-                    lote
-                )
-                contagem = {}
-                for codigo, tipo_acesso, *_ in lote:
-                    if codigo and tipo_acesso in ('organizador', 'celular'):
-                        contagem[codigo] = contagem.get(codigo, 0) + 1
-                for codigo, qtd in contagem.items():
-                    cur.execute(
-                        "UPDATE salas SET acessos_total = acessos_total + %s WHERE codigo = %s",
-                        (qtd, codigo)
-                    )
-        except Exception as e:
-            print(f"⚠ erro ao gravar logs de acesso em lote: {e}")
-        time.sleep(0.5)
-
-
-def registrar_acesso(codigo, tipo_acesso, esp32_id=None, ip=None, user_agent=None):
-    """Enfileira o log — não bloqueia a resposta da requisição."""
-    _iniciar_log_worker()
-    try:
-        _log_queue.put_nowait((codigo, tipo_acesso, esp32_id, ip, user_agent))
-    except Exception as e:
-        print(f"⚠ erro ao enfileirar log de acesso: {e}")
-
-
 def inicializar_schema():
     with conexao() as cur:
         cur.execute("""
@@ -132,12 +70,9 @@ def inicializar_schema():
                 codigo TEXT PRIMARY KEY,
                 criada_em TIMESTAMPTZ NOT NULL DEFAULT now(),
                 ultimo_uso TIMESTAMPTZ NOT NULL DEFAULT now(),
-                quantidade_classificados INTEGER NOT NULL DEFAULT 15,
-                acessos_total INTEGER NOT NULL DEFAULT 0
+                quantidade_classificados INTEGER NOT NULL DEFAULT 15
             );
         """)
-        # se a tabela já existia de uma versão anterior sem essa coluna
-        cur.execute("ALTER TABLE salas ADD COLUMN IF NOT EXISTS acessos_total INTEGER NOT NULL DEFAULT 0;")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS provas (
                 sala_codigo TEXT NOT NULL REFERENCES salas(codigo) ON DELETE CASCADE,
@@ -166,120 +101,30 @@ def inicializar_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_itens_sala_tipo ON itens (sala_codigo, tipo);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_itens_esp32 ON itens (esp32_id);")
 
-        # Logs de acesso (pro painel admin) — não trava nada no caminho
-        # quente, é só gravado em lote pelo _log_worker em segundo plano.
+        # ── config (senha do admin, imagem do botão) e estatísticas (contadores
+        # cumulativos que sobrevivem mesmo depois que as salas são apagadas) ──
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS logs_acesso (
-                id SERIAL PRIMARY KEY,
-                sala_codigo TEXT REFERENCES salas(codigo) ON DELETE CASCADE,
-                tipo_acesso TEXT NOT NULL CHECK (tipo_acesso IN ('organizador', 'celular', 'admin', 'api')),
-                esp32_id TEXT,
-                ip TEXT,
-                user_agent TEXT,
-                data_hora TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_sala ON logs_acesso (sala_codigo);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_data ON logs_acesso (data_hora);")
-
-        # Configuração do admin (só a senha agora — sem imagem)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS admin_config (
+            CREATE TABLE IF NOT EXISTS config (
                 chave TEXT PRIMARY KEY,
-                valor TEXT NOT NULL
+                valor TEXT
             );
         """)
-        cur.execute(
-            "INSERT INTO admin_config (chave, valor) VALUES (%s, %s) ON CONFLICT (chave) DO NOTHING",
-            ("senha_admin", ADMIN_DEFAULT_PASSWORD)
-        )
-
-
-# ════════════════════════════════════════════════════════════════════
-# ADMIN — configurações e estatísticas
-# ════════════════════════════════════════════════════════════════════
-
-def obter_config_admin(chave):
-    with conexao() as cur:
-        cur.execute("SELECT valor FROM admin_config WHERE chave = %s", (chave,))
-        linha = cur.fetchone()
-        return linha['valor'] if linha else None
-
-
-def definir_config_admin(chave, valor):
-    with conexao() as cur:
-        cur.execute(
-            "INSERT INTO admin_config (chave, valor) VALUES (%s, %s) ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor",
-            (chave, valor)
-        )
-
-
-def verificar_senha_admin(senha):
-    return obter_config_admin("senha_admin") == senha
-
-
-def alterar_senha_admin(senha_antiga, senha_nova):
-    if not verificar_senha_admin(senha_antiga):
-        return False
-    definir_config_admin("senha_admin", senha_nova)
-    return True
-
-
-def obter_estatisticas():
-    with conexao() as cur:
-        cur.execute("SELECT COUNT(*) AS total FROM salas")
-        total_salas = cur.fetchone()['total']
-
-        cur.execute("SELECT COUNT(*) AS ativas FROM salas WHERE ultimo_uso > now() - interval '24 hours'")
-        salas_ativas = cur.fetchone()['ativas']
-
-        cur.execute("SELECT COALESCE(SUM(acessos_total), 0) AS total FROM salas")
-        total_acessos = cur.fetchone()['total']
-
-        cur.execute("SELECT COUNT(*) AS total FROM logs_acesso WHERE data_hora > now() - interval '24 hours'")
-        acessos_24h = cur.fetchone()['total']
-
-        cur.execute(
-            "SELECT COUNT(DISTINCT esp32_id) AS total FROM logs_acesso "
-            "WHERE esp32_id IS NOT NULL AND data_hora > now() - interval '24 hours'"
-        )
-        dispositivos_24h = cur.fetchone()['total']
-
-        cur.execute("SELECT COUNT(DISTINCT esp32_id) AS total FROM itens WHERE esp32_id IS NOT NULL")
-        vinculados_agora = cur.fetchone()['total']
-
-        cur.execute("SELECT COUNT(*) AS total FROM provas WHERE ativa = true")
-        provas_ativas = cur.fetchone()['total']
-
-        cur.execute("SELECT COUNT(*) AS total FROM itens")
-        total_passaros = cur.fetchone()['total']
-
         cur.execute("""
-            SELECT codigo, acessos_total, ultimo_uso
-            FROM salas ORDER BY acessos_total DESC LIMIT 10
+            CREATE TABLE IF NOT EXISTS estatisticas (
+                chave TEXT PRIMARY KEY,
+                valor BIGINT NOT NULL DEFAULT 0
+            );
         """)
-        salas_top = [dict(row) for row in cur.fetchall()]
-
-        return {
-            "total_salas": total_salas,
-            "salas_ativas_24h": salas_ativas,
-            "total_acessos": total_acessos,
-            "acessos_24h": acessos_24h,
-            "dispositivos_unicos_24h": dispositivos_24h,
-            "vinculados_agora": vinculados_agora,
-            "provas_ativas": provas_ativas,
-            "total_passaros": total_passaros,
-            "salas_top": salas_top,
-        }
-
-
-def obter_logs_recentes(limite=50):
-    with conexao() as cur:
-        cur.execute("""
-            SELECT id, sala_codigo, tipo_acesso, esp32_id, ip, data_hora
-            FROM logs_acesso ORDER BY data_hora DESC LIMIT %s
-        """, (limite,))
-        return [dict(row) for row in cur.fetchall()]
+        cur.execute("INSERT INTO estatisticas (chave, valor) VALUES ('total_acessos', 0) ON CONFLICT (chave) DO NOTHING;")
+        cur.execute("INSERT INTO estatisticas (chave, valor) VALUES ('total_salas_criadas', 0) ON CONFLICT (chave) DO NOTHING;")
+        cur.execute("INSERT INTO config (chave, valor) VALUES ('imagem_botao', NULL) ON CONFLICT (chave) DO NOTHING;")
+        cur.execute("SELECT valor FROM config WHERE chave = 'admin_senha_hash'")
+        if cur.fetchone() is None:
+            from werkzeug.security import generate_password_hash
+            cur.execute(
+                "INSERT INTO config (chave, valor) VALUES ('admin_senha_hash', %s)",
+                (generate_password_hash('123456'),)
+            )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -313,48 +158,26 @@ def formatar_tempo(seg):
 def criar_sala(codigo):
     with conexao() as cur:
         cur.execute("INSERT INTO salas (codigo) VALUES (%s)", (codigo,))
-        # as 2 provas (eliminatória + final) num INSERT só, em vez de 2
-        cur.execute(
-            """INSERT INTO provas (sala_codigo, tipo, duracao) VALUES
-               (%s, 'eliminatorias', %s), (%s, 'final', %s)""",
-            (codigo, DURACAO_PADRAO['eliminatorias'], codigo, DURACAO_PADRAO['final'])
-        )
-
-
-_ultimo_toque = {}
-_ultimo_toque_lock = threading.Lock()
-_TOQUE_INTERVALO = 30  # segundos — não precisa atualizar "ultimo_uso" a cada tick
+        for tipo, duracao in DURACAO_PADRAO.items():
+            cur.execute(
+                "INSERT INTO provas (sala_codigo, tipo, duracao) VALUES (%s, %s, %s)",
+                (codigo, tipo, duracao)
+            )
 
 
 def sala_existe(codigo):
-    """Verifica se a sala existe. Fazia sempre 2 viagens ao banco (SELECT +
-    UPDATE de ultimo_uso) em toda chamada — inclusive nos ticks do celular,
-    até 10x por segundo. Agora só toca ultimo_uso a cada 30s por sala
-    (guardado em memória) e, fora isso, faz só 1 SELECT leve."""
-    agora = time.monotonic()
-    with _ultimo_toque_lock:
-        precisa_tocar = (agora - _ultimo_toque.get(codigo, 0)) > _TOQUE_INTERVALO
-
-    if precisa_tocar:
-        with conexao() as cur:
-            cur.execute("UPDATE salas SET ultimo_uso = now() WHERE codigo = %s RETURNING 1", (codigo,))
-            existe = cur.fetchone() is not None
-        if existe:
-            with _ultimo_toque_lock:
-                _ultimo_toque[codigo] = agora
-        return existe
-
     with conexao() as cur:
         cur.execute("SELECT 1 FROM salas WHERE codigo = %s", (codigo,))
-        return cur.fetchone() is not None
+        existe = cur.fetchone() is not None
+    if existe:
+        tocar_sala(codigo)
+    return existe
 
 
 def tocar_sala(codigo):
     """Atualiza 'ultimo_uso' — usado pra decidir quais salas apagar depois de 48h."""
     with conexao() as cur:
         cur.execute("UPDATE salas SET ultimo_uso = now() WHERE codigo = %s", (codigo,))
-    with _ultimo_toque_lock:
-        _ultimo_toque[codigo] = time.monotonic()
 
 
 def obter_quantidade_classificados(codigo):
@@ -546,24 +369,23 @@ def desvincular(codigo, tipo, item_id):
 
 def tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_segundos):
     """Atualiza o tempo do pássaro vinculado a esse esp32_id (se a prova
-    dele estiver ativa). Fazia sempre um SELECT com JOIN e depois,
-    condicionalmente, um UPDATE — 2 viagens ao banco por chamada, até 10x
-    por segundo por celular. Agora é 1 UPDATE só (já filtra prova ativa e
-    devolve o vínculo), e nem isso quando não há tempo válido pra salvar
-    (ex.: antes de apertar o botão pela 1ª vez)."""
-    if not tempo_valido:
-        return None
+    dele estiver ativa). Retorna (tipo, item_id) do vínculo atual, ou None."""
     with conexao() as cur:
         cur.execute(
-            """UPDATE itens i SET tempo_texto = %s, tempo_segundos = %s
-               FROM provas p
-               WHERE p.sala_codigo = i.sala_codigo AND p.tipo = i.tipo
-                 AND i.sala_codigo = %s AND i.esp32_id = %s AND p.ativa = true
-               RETURNING i.id, i.tipo""",
-            (tempo_str, tempo_segundos, codigo, esp32_id)
+            """SELECT i.id, i.tipo, p.ativa FROM itens i
+               JOIN provas p ON p.sala_codigo = i.sala_codigo AND p.tipo = i.tipo
+               WHERE i.sala_codigo = %s AND i.esp32_id = %s""",
+            (codigo, esp32_id)
         )
-        linha = cur.fetchone()
-    return (linha['tipo'], linha['id']) if linha else None
+        vinculo = cur.fetchone()
+        if vinculo and tempo_valido and vinculo['ativa']:
+            cur.execute(
+                "UPDATE itens SET tempo_texto = %s, tempo_segundos = %s WHERE id = %s",
+                (tempo_str, tempo_segundos, vinculo['id'])
+            )
+    if vinculo:
+        return (vinculo['tipo'], vinculo['id'])
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -628,3 +450,84 @@ def apagar_salas_expiradas(horas=48):
         )
         apagadas = [l['codigo'] for l in cur.fetchall()]
     return apagadas
+
+
+def status_provas(codigo):
+    """{'eliminatorias': {'ativa':..,'finalizada':..}, 'final': {...}} — usado
+    pelo celular pra saber quais categorias ainda podem receber vínculo."""
+    with conexao() as cur:
+        cur.execute(
+            "SELECT tipo, ativa, finalizada FROM provas WHERE sala_codigo = %s",
+            (codigo,)
+        )
+        linhas = cur.fetchall()
+    return {l['tipo']: {"ativa": l['ativa'], "finalizada": l['finalizada']} for l in linhas}
+
+
+# ════════════════════════════════════════════════════════════════════
+# CONFIG (senha do admin, imagem personalizada do botão) + ESTATÍSTICAS
+# ════════════════════════════════════════════════════════════════════
+
+def obter_config(chave, padrao=None):
+    with conexao() as cur:
+        cur.execute("SELECT valor FROM config WHERE chave = %s", (chave,))
+        linha = cur.fetchone()
+    return linha['valor'] if linha else padrao
+
+
+def definir_config(chave, valor):
+    with conexao() as cur:
+        cur.execute(
+            """INSERT INTO config (chave, valor) VALUES (%s, %s)
+               ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor""",
+            (chave, valor)
+        )
+
+
+def verificar_senha_admin(senha):
+    from werkzeug.security import check_password_hash
+    h = obter_config('admin_senha_hash')
+    if not h:
+        return False
+    try:
+        return check_password_hash(h, senha or '')
+    except Exception:
+        return False
+
+
+def trocar_senha_admin(nova_senha):
+    from werkzeug.security import generate_password_hash
+    definir_config('admin_senha_hash', generate_password_hash(nova_senha))
+
+
+def incrementar_acesso():
+    with conexao() as cur:
+        cur.execute(
+            "UPDATE estatisticas SET valor = valor + 1 WHERE chave = 'total_acessos' RETURNING valor"
+        )
+        linha = cur.fetchone()
+    return linha['valor'] if linha else 0
+
+
+def incrementar_salas_criadas():
+    with conexao() as cur:
+        cur.execute("UPDATE estatisticas SET valor = valor + 1 WHERE chave = 'total_salas_criadas'")
+
+
+def obter_estatisticas_gerais():
+    with conexao() as cur:
+        cur.execute("SELECT chave, valor FROM estatisticas")
+        stats = {l['chave']: l['valor'] for l in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) AS n FROM salas")
+        salas_no_banco = cur.fetchone()['n']
+        cur.execute("SELECT COUNT(*) AS n FROM salas WHERE ultimo_uso > now() - interval '15 minutes'")
+        salas_ativas_agora = cur.fetchone()['n']
+        cur.execute("SELECT COUNT(*) AS n FROM itens")
+        total_passaros = cur.fetchone()['n']
+    return {
+        "total_acessos": stats.get('total_acessos', 0),
+        "total_salas_criadas": stats.get('total_salas_criadas', 0),
+        "salas_no_banco_agora": salas_no_banco,
+        "salas_ativas_ultimos_15min": salas_ativas_agora,
+        "total_passaros_cadastrados_agora": total_passaros,
+    }
