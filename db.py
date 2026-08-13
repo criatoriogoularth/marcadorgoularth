@@ -353,22 +353,37 @@ def vincular(codigo, tipo, item_id, esp32_id):
         prova = cur.fetchone()
 
     comandos = [f"NOME:{item['nome'][:16]}"]
-    if prova and prova['ativa']:
+    ativa = bool(prova and prova['ativa'])
+    if ativa:
         comandos.append(f"PROVA:{formatar_tempo(tempo_restante_segundos(prova))}")
-    return {"ok": True, "comandos": comandos}
+    # devolve também "ativa" pra quem chamou já guardar em cache (memória)
+    # e o tick desse celular não precisar mais consultar o banco pra saber
+    # se a prova está rodando ou não
+    return {"ok": True, "comandos": comandos, "ativa": ativa}
 
 
 def desvincular(codigo, tipo, item_id):
     with conexao() as cur:
         cur.execute(
+            "SELECT esp32_id FROM itens WHERE sala_codigo = %s AND tipo = %s AND id = %s",
+            (codigo, tipo, item_id)
+        )
+        linha = cur.fetchone()
+        esp32_id_antigo = linha['esp32_id'] if linha else None
+        cur.execute(
             "UPDATE itens SET esp32_id = NULL WHERE sala_codigo = %s AND tipo = %s AND id = %s",
             (codigo, tipo, item_id)
         )
+    return esp32_id_antigo   # pra quem chamou poder limpar o cache desse celular
 
 
 def tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_segundos):
-    """Atualiza o tempo do pássaro vinculado a esse esp32_id (se a prova
-    dele estiver ativa). Retorna (tipo, item_id) do vínculo atual, ou None."""
+    """Versão 'completa' (com consulta ao banco) — usada só quando o
+    servidor ainda não tem em cache (memória) o vínculo desse celular,
+    ou seja: primeiro tick depois de conectar, ou logo após o servidor
+    reiniciar. Confirma tudo no banco e devolve o suficiente pro
+    chamador guardar em cache e não precisar mais consultar a cada
+    tick. Retorna {"tipo","item_id","ativa"} ou None se não vinculado."""
     with conexao() as cur:
         cur.execute(
             """SELECT i.id, i.tipo, p.ativa FROM itens i
@@ -383,8 +398,21 @@ def tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_segundos):
                 (tempo_str, tempo_segundos, vinculo['id'])
             )
     if vinculo:
-        return (vinculo['tipo'], vinculo['id'])
+        return {"tipo": vinculo['tipo'], "item_id": vinculo['id'], "ativa": vinculo['ativa']}
     return None
+
+
+def gravar_tempo(item_id, tempo_texto, tempo_segundos):
+    """Caminho 'rápido' do tick: usado quando o servidor já sabe (por
+    cache em memória) a quem esse celular pertence e que a prova dele
+    está ativa — grava direto, sem nenhuma consulta (SELECT/JOIN) antes,
+    só o UPDATE. É essa troca (1 consulta a menos por tick, 10x por
+    segundo por celular) que reduz o delay entre celular e site."""
+    with conexao() as cur:
+        cur.execute(
+            "UPDATE itens SET tempo_texto = %s, tempo_segundos = %s WHERE id = %s",
+            (tempo_texto, tempo_segundos, item_id)
+        )
 
 
 # ════════════════════════════════════════════════════════════════════

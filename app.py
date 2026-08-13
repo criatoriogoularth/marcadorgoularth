@@ -18,15 +18,49 @@ app = Flask(__name__)
 # ════════════════════════════════════════════════════════════════════
 
 conexoes_lock = threading.Lock()
-conexoes = {}   # esp32_id -> {"fila_saida": [...], "ultimo_tick": ts}
+# esp32_id -> {"fila_saida": [...], "ultimo_tick": ts,
+#              "vinculo": {"codigo","tipo","item_id"} | None,
+#              "ativa": bool}
+# "vinculo" e "ativa" são um CACHE em memória de quem é esse celular e se a
+# prova dele está rodando — populado quando vincula/inicia/finaliza a prova.
+# Existe justamente pra o tick (chamado ~10x por segundo por celular) não
+# precisar mais consultar o banco a cada vez só pra descobrir isso; ele só
+# consulta o banco de novo se esse cache estiver vazio (celular que acabou
+# de conectar, ou servidor que acabou de reiniciar).
+conexoes = {}
+
+
+def _entrada_padrao():
+    return {"fila_saida": [], "ultimo_tick": time.time(), "vinculo": None, "ativa": False}
 
 
 def empurrar_comandos(esp32_id, comandos):
     if not esp32_id or not comandos:
         return
     with conexoes_lock:
-        c = conexoes.setdefault(esp32_id, {"fila_saida": [], "ultimo_tick": time.time()})
+        c = conexoes.setdefault(esp32_id, _entrada_padrao())
         c["fila_saida"].extend(comandos)
+
+
+def marcar_prova_ativa_para(esp32_ids, ativa):
+    """Atualiza o cache de 'prova está rodando?' pros celulares vinculados,
+    sem tocar no banco — usado ao iniciar/finalizar/limpar uma prova."""
+    if not esp32_ids:
+        return
+    with conexoes_lock:
+        for esp32_id in esp32_ids:
+            c = conexoes.setdefault(esp32_id, _entrada_padrao())
+            c["ativa"] = ativa
+
+
+def limpar_vinculo_cache(esp32_id):
+    if not esp32_id:
+        return
+    with conexoes_lock:
+        c = conexoes.get(esp32_id)
+        if c:
+            c["vinculo"] = None
+            c["ativa"] = False
 
 
 def novo_codigo_sala():
@@ -119,6 +153,7 @@ def api_iniciar_prova(codigo, tipo):
     if resultado is None:
         return jsonify({"ok": False, "erro": "nenhum pássaro nessa prova"}), 400
     restante_txt = db.formatar_tempo(resultado['duracao'])
+    marcar_prova_ativa_para(resultado['vinculados'], True)
     for esp32_id in resultado['vinculados']:
         empurrar_comandos(esp32_id, [f"PROVA:{restante_txt}"])
     return jsonify({"ok": True})
@@ -130,6 +165,7 @@ def api_finalizar_prova(codigo, tipo):
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
     vinculados = db.finalizar_prova(codigo, tipo)
+    marcar_prova_ativa_para(vinculados, False)
     for esp32_id in vinculados:
         empurrar_comandos(esp32_id, ["FINALIZAR"])
     return jsonify({"ok": True})
@@ -141,6 +177,10 @@ def api_limpar_prova(codigo, tipo):
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
     vinculados = db.limpar_prova(codigo, tipo)
+    # os pássaros dessa prova foram apagados do banco — o cache de vínculo
+    # desses celulares (item_id antigo) não vale mais nada
+    for esp32_id in vinculados:
+        limpar_vinculo_cache(esp32_id)
     for esp32_id in vinculados:
         empurrar_comandos(esp32_id, ["RESET"])
     return jsonify({"ok": True})
@@ -199,7 +239,12 @@ def api_vincular(codigo):
         return jsonify(resultado), status
 
     with conexoes_lock:
-        conexoes[esp32_id] = {"fila_saida": list(resultado['comandos']), "ultimo_tick": time.time()}
+        conexoes[esp32_id] = {
+            "fila_saida": list(resultado['comandos']),
+            "ultimo_tick": time.time(),
+            "vinculo": {"codigo": codigo, "tipo": tipo, "item_id": item_id},
+            "ativa": resultado['ativa'],
+        }
     return jsonify({"ok": True})
 
 
@@ -216,15 +261,30 @@ def api_desvincular(codigo):
         return jsonify({"ok": False}), 400
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 400
-    db.desvincular(codigo, tipo, item_id)
+    esp32_id_antigo = db.desvincular(codigo, tipo, item_id)
+    limpar_vinculo_cache(esp32_id_antigo)
     return jsonify({"ok": True})
 
 
 @app.route('/api/sala/<codigo>/tick', methods=['POST'])
 def api_tick(codigo):
+    # ────────────────────────────────────────────────────────────────
+    # Esse endpoint é chamado ~10x por segundo por CADA celular
+    # conectado, então é o ponto mais sensível a delay do site inteiro.
+    # Antes, cada chamada fazia até 3 idas ao banco (checar se a sala
+    # existe + "tocar" ela, e um SELECT+JOIN pra descobrir de quem é
+    # o vínculo e se a prova tá rodando, antes até do UPDATE em si).
+    #
+    # Agora: o vínculo e o "a prova tá ativa?" ficam guardados em cache
+    # (memória), atualizados nos momentos em que isso de fato muda
+    # (vincular/desvincular/iniciar/finalizar/limpar prova). Assim, na
+    # imensa maioria dos ticks, é só 1 UPDATE (e só quando o celular
+    # está realmente contando) ou ZERO consultas (celular parado, só
+    # entregando comandos que já estavam na fila em memória). Só cai de
+    # volta pra consultar o banco se o cache tiver vazio (primeiro tick
+    # depois de conectar, ou logo após o servidor reiniciar).
+    # ────────────────────────────────────────────────────────────────
     codigo = codigo.upper()
-    if not db.sala_existe(codigo):
-        return jsonify({"ok": False, "erro": "sala não encontrada"}), 404
     dados = request.get_json(force=True) or {}
     esp32_id = dados.get('esp32_id')
     tempo_str = dados.get('t', '')
@@ -232,14 +292,39 @@ def api_tick(codigo):
         return jsonify({"ok": False}), 400
 
     tempo_valido = db.validar_tempo(tempo_str)
-    tempo_seg = db.tempo_para_segundos(tempo_str) if tempo_valido else 0.0
-    db.tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_seg)
 
     with conexoes_lock:
-        c = conexoes.setdefault(esp32_id, {"fila_saida": [], "ultimo_tick": time.time()})
+        c = conexoes.setdefault(esp32_id, _entrada_padrao())
         c["ultimo_tick"] = time.time()
         comandos = c["fila_saida"]
         c["fila_saida"] = []
+        vinculo = c.get("vinculo")
+        ativa = c.get("ativa", False)
+
+    if tempo_valido:
+        if vinculo is not None and vinculo.get("codigo") == codigo:
+            # caminho rápido: já sabemos de quem é e se tá rodando —
+            # grava direto, sem nenhuma consulta antes
+            if ativa:
+                tempo_seg = db.tempo_para_segundos(tempo_str)
+                try:
+                    db.gravar_tempo(vinculo["item_id"], tempo_str, tempo_seg)
+                except Exception:
+                    pass
+        else:
+            # sem cache ainda — confirma no banco uma vez só, e guarda o
+            # resultado em cache pras próximas chamadas desse celular
+            tempo_seg = db.tempo_para_segundos(tempo_str)
+            try:
+                resultado = db.tick(codigo, esp32_id, tempo_str, tempo_valido, tempo_seg)
+            except Exception:
+                resultado = None
+            if resultado:
+                with conexoes_lock:
+                    cc = conexoes.setdefault(esp32_id, _entrada_padrao())
+                    cc["vinculo"] = {"codigo": codigo, "tipo": resultado["tipo"], "item_id": resultado["item_id"]}
+                    cc["ativa"] = resultado["ativa"]
+
     return jsonify({"ok": True, "comandos": comandos})
 
 
@@ -273,6 +358,7 @@ def _reaper():
         time.sleep(2)
         try:
             for vencida in db.provas_para_finalizar_automaticamente():
+                marcar_prova_ativa_para(vencida['vinculados'], False)
                 for esp32_id in vencida['vinculados']:
                     empurrar_comandos(esp32_id, ["FINALIZAR"])
         except Exception as e:
@@ -922,14 +1008,21 @@ HTML_CELULAR = """<!DOCTYPE html>
   .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:14px 0 8px; }
   .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444; }
   .bolinha.ok { background:#10b981; }
-  .lcd { background:#000; border-radius:14px; padding:18px 12px; margin-bottom:22px; border:3px solid #223; }
+  .lcd { background:#000; border-radius:14px; padding:14px 12px; margin-bottom:14px; border:3px solid #223; }
   .lcd-linha0 { color:#F0C030; font-family:monospace; font-size:20px; text-align:center;
                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:34px; text-align:center; margin-top:6px; letter-spacing:1px; }
-  .botao-canto { width:100%; padding:60px 0; border-radius:24px; border:none; font-weight:bold; font-size:20px;
-                 color:white; background:#1558B0; box-shadow:0 4px 0 #0d3a7c; touch-action:none; }
+  /* o botão de cantar ocupa o resto da tela (min-height em vh) — fica bem
+     grande e não deixa espaço embaixo dele pra encostar em outro botão */
+  .botao-canto { width:100%; min-height:42vh; border-radius:24px; border:none; font-weight:bold; font-size:22px;
+                 color:white; background:#1558B0; box-shadow:0 4px 0 #0d3a7c; touch-action:none;
+                 display:flex; align-items:center; justify-content:center; text-align:center; padding:16px; }
   .botao-canto.pressionado { background:#177A38; box-shadow:0 2px 0 #0d3a7c; transform:translateY(2px); }
   .botao-canto:disabled { background:#374158; box-shadow:0 4px 0 #232a3a; color:#7c88a6; }
+  /* botão de trocar pássaro: fica em cima (longe do polegar que aperta
+     "segure para cantar" lá embaixo) e é discreto de propósito, pra não
+     ser apertado sem querer */
+  .btn-trocar-passaro { width:100%; font-size:12px; padding:8px 10px; opacity:0.8; margin-bottom:12px; }
 </style>
 </head>
 <body>
@@ -950,14 +1043,12 @@ HTML_CELULAR = """<!DOCTYPE html>
   </div>
 
   <div id="telaMarcador" style="display:none">
+    <button class="btn-roxo btn-trocar-passaro" onclick="trocarPassaro()">🔄 Trocar pássaro vinculado</button>
     <div class="lcd">
       <div class="lcd-linha0" id="lcdLinha0">-</div>
       <div class="lcd-linha1" id="lcdLinha1">00:00:000</div>
     </div>
     <button class="botao-canto" id="botaoCanto">AGUARDANDO INÍCIO DA PROVA</button>
-    <div class="linha-botoes">
-      <button class="btn-roxo" onclick="trocarPassaro()" style="width:100%">🔄 Trocar pássaro vinculado</button>
-    </div>
   </div>
 </div>
 

@@ -93,7 +93,25 @@ várias coisas o tempo todo) pra não pesar no resto do site.
   aba do admin estiver aberta — não afeta a tela do organizador nem a do
   celular.
 
-## O que mudou nesta versão
+## O que mudou nesta versão (última atualização)
+
+- **Delay entre celular e site bem menor**: antes, cada "tick" do celular
+  (10x por segundo) fazia até 3 idas ao banco antes de gravar o tempo
+  (checar se a sala existe, "tocar" ela, e um SELECT+JOIN pra descobrir de
+  quem é o vínculo). Agora o servidor guarda isso em memória (cache) assim
+  que o celular vincula/a prova inicia, e o tick vira só 1 UPDATE quando
+  está contando, ou nenhuma consulta ao banco quando está parado — só volta
+  a consultar o banco se esse cache estiver vazio (primeiro tick depois de
+  conectar, ou logo após o servidor reiniciar).
+- **Botão "Trocar pássaro vinculado" mudou de lugar**: agora fica em cima,
+  antes do relógio — longe de onde o polegar fica apertando "SEGURE PARA
+  CANTAR" lá embaixo — e ficou visualmente menor/discreto, pra reduzir
+  chance de apertar sem querer.
+- **Botão "SEGURE PARA CANTAR" ficou bem maior**, ocupando boa parte do
+  resto da tela — além de mais fácil de acertar, não sobra espaço vazio
+  embaixo dele pra acabar encostando em outra coisa.
+
+## Versão anterior
 
 - **Contadores reais** (acessos, salas criadas, pássaros cadastrados,
   celulares conectados agora) — visíveis em `/admin`, de forma leve.
