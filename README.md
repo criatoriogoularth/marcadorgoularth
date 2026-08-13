@@ -78,34 +78,30 @@ configurar a variável.
 ## Painel do administrador (`/admin`)
 
 Existe uma aba separada, em `SEU-SITE.onrender.com/admin`, só pra você (dono
-do site) — não é a mesma coisa que o código de sala.
+do site) — não é a mesma coisa que o código de sala. Ela foi feita de
+propósito bem simples e leve (quase sem JavaScript, sem ficar atualizando
+várias coisas o tempo todo) pra não pesar no resto do site.
 
 - **Senha padrão: `123456`**. Troca ela assim que entrar pela primeira vez,
-  na seção "Trocar senha do admin" — não precisa mexer em nada no Neon ou no
-  Render pra isso, fica salvo no banco.
-- Mostra contadores em tempo real: acessos totais, salas criadas, salas
-  ativas agora, pássaros cadastrados agora e quantos celulares estão
-  conectados neste exato momento (atualiza sozinho a cada 5s).
-- Deixa trocar a imagem do botão "SEGURE PARA CANTAR" da tela do celular por
-  uma foto sua. A imagem é redimensionada e comprimida automaticamente no
-  seu navegador antes de enviar (fica leve, não pesa no app). Dá pra voltar
-  pro botão padrão a qualquer momento.
-- A sessão do admin dura 12h; clica em "Sair" se estiver usando um
-  computador compartilhado.
+  na seção "Trocar senha" — fica salvo no banco, não precisa mexer em nada
+  no Neon ou no Render.
+- Mostra 4 números: acessos totais (desde sempre), salas criadas (desde
+  sempre), pássaros cadastrados (desde sempre) e celulares conectados agora.
+- Os três primeiros só atualizam quando você recarrega a página (F5) — de
+  propósito, pra não gerar tráfego extra no site. Só o de "celulares
+  conectados agora" atualiza sozinho, a cada 10 segundos, e só enquanto essa
+  aba do admin estiver aberta — não afeta a tela do organizador nem a do
+  celular.
 
 ## O que mudou nesta versão
 
-- **Contadores reais** (acessos, salas criadas, salas ativas, celulares
-  conectados) — visíveis em `/admin`.
-- **Tela do celular redesenhada** (visual mais limpo, indicador de conexão
-  com pulso, relógio com mais destaque) e possibilidade de colocar uma
-  **imagem personalizada no botão** de marcar, configurável em `/admin`.
+- **Contadores reais** (acessos, salas criadas, pássaros cadastrados,
+  celulares conectados agora) — visíveis em `/admin`, de forma leve.
 - **Delay reduzido entre celular e organizador**: o celular só grava um novo
   tempo no banco enquanto está realmente contando (antes gravava a cada
-  100ms mesmo parado); a tela do organizador atualiza a cada 400ms em vez de
-  1s; e o pool de conexões com o banco dobrou de tamanho. Se mesmo assim o
-  delay incomodar com muitos celulares ao mesmo tempo, vale aumentar
-  `--threads` no Start Command do Render (ex: de 8 pra 16).
+  100ms mesmo parado), e o pool de conexões com o banco dobrou de tamanho.
+  Se o delay ainda incomodar com muitos celulares ao mesmo tempo, vale
+  aumentar `--threads` no Start Command do Render (ex: de 8 pra 16).
 - **Milissegundos no cronômetro grande** da Eliminatória/Final (organizador),
   além de minutos e segundos — atualiza suavemente sem precisar bater no
   servidor a cada 100ms (calcula localmente entre uma sincronização e outra).

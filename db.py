@@ -101,7 +101,7 @@ def inicializar_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_itens_sala_tipo ON itens (sala_codigo, tipo);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_itens_esp32 ON itens (esp32_id);")
 
-        # ── config (senha do admin, imagem do botão) e estatísticas (contadores
+        # ── config (senha do admin) e estatísticas (contadores
         # cumulativos que sobrevivem mesmo depois que as salas são apagadas) ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS config (
@@ -117,7 +117,6 @@ def inicializar_schema():
         """)
         cur.execute("INSERT INTO estatisticas (chave, valor) VALUES ('total_acessos', 0) ON CONFLICT (chave) DO NOTHING;")
         cur.execute("INSERT INTO estatisticas (chave, valor) VALUES ('total_salas_criadas', 0) ON CONFLICT (chave) DO NOTHING;")
-        cur.execute("INSERT INTO config (chave, valor) VALUES ('imagem_botao', NULL) ON CONFLICT (chave) DO NOTHING;")
         cur.execute("SELECT valor FROM config WHERE chave = 'admin_senha_hash'")
         if cur.fetchone() is None:
             from werkzeug.security import generate_password_hash
@@ -465,7 +464,7 @@ def status_provas(codigo):
 
 
 # ════════════════════════════════════════════════════════════════════
-# CONFIG (senha do admin, imagem personalizada do botão) + ESTATÍSTICAS
+# CONFIG (senha do admin) + ESTATÍSTICAS
 # ════════════════════════════════════════════════════════════════════
 
 def obter_config(chave, padrao=None):
@@ -515,19 +514,15 @@ def incrementar_salas_criadas():
 
 
 def obter_estatisticas_gerais():
+    """Só os contadores acumulados que sobrevivem à limpeza de salas —
+    leves de calcular (nenhuma conta "ao vivo" pesada aqui)."""
     with conexao() as cur:
         cur.execute("SELECT chave, valor FROM estatisticas")
         stats = {l['chave']: l['valor'] for l in cur.fetchall()}
-        cur.execute("SELECT COUNT(*) AS n FROM salas")
-        salas_no_banco = cur.fetchone()['n']
-        cur.execute("SELECT COUNT(*) AS n FROM salas WHERE ultimo_uso > now() - interval '15 minutes'")
-        salas_ativas_agora = cur.fetchone()['n']
         cur.execute("SELECT COUNT(*) AS n FROM itens")
         total_passaros = cur.fetchone()['n']
     return {
         "total_acessos": stats.get('total_acessos', 0),
         "total_salas_criadas": stats.get('total_salas_criadas', 0),
-        "salas_no_banco_agora": salas_no_banco,
-        "salas_ativas_ultimos_15min": salas_ativas_agora,
-        "total_passaros_cadastrados_agora": total_passaros,
+        "total_passaros_cadastrados": total_passaros,
     }

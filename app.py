@@ -3,15 +3,12 @@ import time
 import random
 import string
 import threading
-from functools import wraps
 
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify
 
 import db
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
-app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 12  # 12h de sessão pro admin
 
 # ════════════════════════════════════════════════════════════════════
 # ESTADO EFÊMERO (só isso continua em memória — não precisa sobreviver
@@ -265,99 +262,6 @@ def api_status_provas(codigo):
     if not db.sala_existe(codigo):
         return jsonify({"ok": False}), 404
     return jsonify({"ok": True, "status": db.status_provas(codigo)})
-
-
-# ════════════════════════════════════════════════════════════════════
-# API — CONFIG PÚBLICA (imagem do botão do celular, lida sem senha)
-# ════════════════════════════════════════════════════════════════════
-
-@app.route('/api/config/publico')
-def api_config_publico():
-    try:
-        imagem = db.obter_config('imagem_botao')
-    except Exception:
-        imagem = None
-    return jsonify({"ok": True, "imagem_botao": imagem})
-
-
-# ════════════════════════════════════════════════════════════════════
-# API — ADMIN (senha própria, separada do código de sala)
-# ════════════════════════════════════════════════════════════════════
-
-def admin_necessario(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not session.get('admin_ok'):
-            return jsonify({"ok": False, "erro": "não autenticado"}), 401
-        return f(*args, **kwargs)
-    return wrapper
-
-
-@app.route('/api/admin/status')
-def api_admin_status():
-    return jsonify({"ok": True, "autenticado": bool(session.get('admin_ok'))})
-
-
-@app.route('/api/admin/login', methods=['POST'])
-def api_admin_login():
-    dados = request.get_json(force=True) or {}
-    senha = dados.get('senha', '')
-    try:
-        valido = db.verificar_senha_admin(senha)
-    except Exception:
-        return jsonify({"ok": False, "erro": "banco de dados indisponível"}), 503
-    if not valido:
-        return jsonify({"ok": False, "erro": "senha incorreta"}), 401
-    session.permanent = True
-    session['admin_ok'] = True
-    return jsonify({"ok": True})
-
-
-@app.route('/api/admin/logout', methods=['POST'])
-def api_admin_logout():
-    session.pop('admin_ok', None)
-    return jsonify({"ok": True})
-
-
-@app.route('/api/admin/stats')
-@admin_necessario
-def api_admin_stats():
-    stats = db.obter_estatisticas_gerais()
-    agora = time.time()
-    with conexoes_lock:
-        dispositivos_conectados_agora = sum(
-            1 for c in conexoes.values() if agora - c['ultimo_tick'] <= 10
-        )
-    stats['dispositivos_conectados_agora'] = dispositivos_conectados_agora
-    return jsonify({"ok": True, "stats": stats})
-
-
-@app.route('/api/admin/trocar_senha', methods=['POST'])
-@admin_necessario
-def api_admin_trocar_senha():
-    dados = request.get_json(force=True) or {}
-    atual = dados.get('senha_atual', '')
-    nova = dados.get('nova_senha', '')
-    if not db.verificar_senha_admin(atual):
-        return jsonify({"ok": False, "erro": "senha atual incorreta"}), 401
-    if len(nova) < 4:
-        return jsonify({"ok": False, "erro": "a nova senha precisa ter pelo menos 4 caracteres"}), 400
-    db.trocar_senha_admin(nova)
-    return jsonify({"ok": True})
-
-
-@app.route('/api/admin/imagem_botao', methods=['POST'])
-@admin_necessario
-def api_admin_imagem_botao():
-    dados = request.get_json(force=True) or {}
-    imagem = dados.get('imagem')
-    if imagem:
-        if not isinstance(imagem, str) or not imagem.startswith('data:image/'):
-            return jsonify({"ok": False, "erro": "imagem inválida"}), 400
-        if len(imagem) > 700_000:
-            return jsonify({"ok": False, "erro": "imagem muito grande (tenta uma foto menor)"}), 400
-    db.definir_config('imagem_botao', imagem)
-    return jsonify({"ok": True})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -981,7 +885,7 @@ async function sincronizarFundo() {
 
 setInterval(() => {
   if (telaAtual === 'eliminatorias' || telaAtual === 'final') atualizarProva();
-}, 400);
+}, 1000);
 // interpolação local do relógio grande — atualiza a cada 100ms (com
 // milissegundos) sem precisar bater no servidor a essa frequência
 setInterval(() => {
@@ -1015,30 +919,17 @@ HTML_CELULAR = """<!DOCTYPE html>
 <title>Celular como ESP32</title>
 <style>""" + ESTILO_BASE + """
   body { user-select:none; }
-  .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:16px 0 8px;
-                display:flex; align-items:center; gap:6px; letter-spacing:.03em; }
-  .cat-titulo .risco { flex:1; height:1px; background:linear-gradient(90deg,#F0C03055,transparent); }
-  .cat-encerrada { color:#7c88a6; font-size:13px; margin:10px 0 4px; font-style:italic; }
-  .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444;
-             box-shadow:0 0 6px #ef4444; transition:background .3s, box-shadow .3s; }
-  .bolinha.ok { background:#10b981; box-shadow:0 0 6px #10b981aa; animation:pulso 1.6s infinite; }
-  @keyframes pulso { 0%,100%{opacity:1;} 50%{opacity:.55;} }
-  .lcd { background:linear-gradient(180deg,#0a0f1c,#050810); border-radius:16px; padding:20px 14px; margin-bottom:22px;
-         border:1px solid #263049; box-shadow:inset 0 2px 10px #000a, 0 6px 18px -6px #000a; }
-  .lcd-linha0 { color:#F0C030; font-family:'Courier New',monospace; font-size:19px; text-align:center;
-                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:0 0 8px #F0C03066; }
-  .lcd-linha1 { color:#3ddc84; font-family:'Courier New',monospace; font-size:36px; text-align:center; margin-top:8px;
-                letter-spacing:1px; text-shadow:0 0 12px #3ddc8477; }
-  .botao-canto { width:100%; padding:64px 0; border-radius:26px; border:none; font-weight:800; font-size:19px;
-                 letter-spacing:.02em; color:white; background:linear-gradient(180deg,#2E6FE0,#1558B0);
-                 box-shadow:0 5px 0 #0d3a7c, 0 8px 16px -4px #0007; touch-action:none; position:relative;
-                 overflow:hidden; background-size:cover; background-position:center; transition:filter .1s, transform .05s; }
-  .botao-canto.tem-imagem { color:white; text-shadow:0 1px 6px #000, 0 0 3px #000; }
-  .botao-canto.tem-imagem::before { content:""; position:absolute; inset:0;
-        background:linear-gradient(180deg, transparent 40%, #000000aa 100%); }
-  .botao-canto span.rotulo { position:relative; z-index:1; }
-  .botao-canto.pressionado { filter:brightness(.72); box-shadow:0 2px 0 #0d3a7c; transform:translateY(3px); }
-  .botao-canto:disabled { background:#374158; box-shadow:0 4px 0 #232a3a; color:#7c88a6; filter:none; }
+  .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:14px 0 8px; }
+  .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444; }
+  .bolinha.ok { background:#10b981; }
+  .lcd { background:#000; border-radius:14px; padding:18px 12px; margin-bottom:22px; border:3px solid #223; }
+  .lcd-linha0 { color:#F0C030; font-family:monospace; font-size:20px; text-align:center;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:34px; text-align:center; margin-top:6px; letter-spacing:1px; }
+  .botao-canto { width:100%; padding:60px 0; border-radius:24px; border:none; font-weight:bold; font-size:20px;
+                 color:white; background:#1558B0; box-shadow:0 4px 0 #0d3a7c; touch-action:none; }
+  .botao-canto.pressionado { background:#177A38; box-shadow:0 2px 0 #0d3a7c; transform:translateY(2px); }
+  .botao-canto:disabled { background:#374158; box-shadow:0 4px 0 #232a3a; color:#7c88a6; }
 </style>
 </head>
 <body>
@@ -1049,11 +940,11 @@ HTML_CELULAR = """<!DOCTYPE html>
 
   <div id="telaVincular">
     <div id="blocoElim">
-      <div class="cat-titulo">🔵 ELIMINATÓRIA<span class="risco"></span></div>
+      <div class="cat-titulo">🔵 ELIMINATÓRIA</div>
       <div id="listaElim"><div class="vazio">carregando...</div></div>
     </div>
     <div id="blocoFinal">
-      <div class="cat-titulo">🔴 FINAL<span class="risco"></span></div>
+      <div class="cat-titulo">🔴 FINAL</div>
       <div id="listaFinal"><div class="vazio">carregando...</div></div>
     </div>
   </div>
@@ -1063,7 +954,7 @@ HTML_CELULAR = """<!DOCTYPE html>
       <div class="lcd-linha0" id="lcdLinha0">-</div>
       <div class="lcd-linha1" id="lcdLinha1">00:00:000</div>
     </div>
-    <button class="botao-canto" id="botaoCanto"><span class="rotulo">AGUARDANDO INÍCIO DA PROVA</span></button>
+    <button class="botao-canto" id="botaoCanto">AGUARDANDO INÍCIO DA PROVA</button>
     <div class="linha-botoes">
       <button class="btn-roxo" onclick="trocarPassaro()" style="width:100%">🔄 Trocar pássaro vinculado</button>
     </div>
@@ -1173,26 +1064,8 @@ function parseTempoParaMs(str) {
 function atualizarBotao() {
   const btn = document.getElementById('botaoCanto');
   btn.disabled = botaoBloqueado;
-  btn.querySelector('.rotulo').textContent = botaoBloqueado ? 'AGUARDANDO INÍCIO DA PROVA' : 'SEGURE PARA CANTAR';
+  btn.textContent = botaoBloqueado ? 'AGUARDANDO INÍCIO DA PROVA' : 'SEGURE PARA CANTAR';
 }
-
-// imagem personalizada de fundo do botão (configurada em /admin) — busca uma
-// vez só no início, é leve e não pesa no funcionamento do app
-async function aplicarImagemBotao() {
-  try {
-    const resp = await fetch('/api/config/publico');
-    const data = await resp.json();
-    const btn = document.getElementById('botaoCanto');
-    if (data.ok && data.imagem_botao) {
-      btn.style.backgroundImage = `url("${data.imagem_botao}")`;
-      btn.classList.add('tem-imagem');
-    } else {
-      btn.style.backgroundImage = '';
-      btn.classList.remove('tem-imagem');
-    }
-  } catch (e) {}
-}
-aplicarImagemBotao();
 
 const botaoEl = document.getElementById('botaoCanto');
 function iniciarCanto(ev) {
@@ -1379,252 +1252,153 @@ def tela_celular(codigo):
     return HTML_CELULAR
 
 
-HTML_ADMIN = """<!DOCTYPE html>
+
+# ════════════════════════════════════════════════════════════════════
+# /admin — página simples e leve, renderizada no servidor (sem JS
+# pesado, sem polling de várias coisas de uma vez). Só um número (os
+# celulares conectados agora) atualiza sozinho a cada 10s; o resto
+# (acessos, salas criadas, pássaros cadastrados) é calculado uma vez
+# quando a página carrega — dá pra atualizar manualmente (F5) quando
+# quiser ver de novo.
+# ════════════════════════════════════════════════════════════════════
+
+def _pagina_admin_login(erro=None):
+    erro_html = f'<div class="erro-msg">{erro}</div>' if erro else ''
+    return """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Admin — Marcador Digital Goularth</title>
+<title>Admin</title>
+<style>""" + ESTILO_BASE + """
+  .erro-msg { color:#ff6b6b; font-size:13px; margin-top:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔐 Admin</h1>
+  <div class="card">
+    <form method="GET" action="/admin">
+      <input type="password" name="senha" placeholder="Senha do admin" autofocus>
+      <button class="btn-ouro" type="submit" style="width:100%">Entrar</button>
+    </form>
+    """ + erro_html + """
+  </div>
+</div>
+</body>
+</html>"""
+
+
+def _pagina_admin_painel(stats, senha):
+    import json
+    from urllib.parse import quote
+    senha_js = json.dumps(quote(senha))
+    return """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin</title>
 <style>""" + ESTILO_BASE + """
   .stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
   .stat-box { background:#0f1830; border-radius:10px; padding:14px; text-align:center; }
   .stat-num { font-size:26px; font-weight:bold; color:#F0C030; font-family:monospace; }
   .stat-label { font-size:11px; color:#93a4c3; margin-top:4px; }
-  .preview-botao { width:100%; padding:40px 0; border-radius:20px; text-align:center; color:white;
-                    font-weight:bold; background:#1558B0; background-size:cover; background-position:center;
-                    margin:10px 0; position:relative; }
-  .preview-botao span { position:relative; z-index:1; text-shadow:0 1px 6px #000; }
-  .preview-botao.tem-imagem::before { content:""; position:absolute; inset:0; border-radius:20px;
-        background:linear-gradient(180deg, transparent 40%, #000000aa 100%); }
-  .erro-msg { color:#ff6b6b; font-size:13px; margin-top:6px; display:none; }
-  .ok-msg { color:#3ddc84; font-size:13px; margin-top:6px; display:none; }
+  .ok-msg { color:#3ddc84; font-size:13px; margin-top:6px; }
+  .erro-msg { color:#ff6b6b; font-size:13px; margin-top:6px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🔐 Painel do administrador</h1>
-  <div class="sub">contadores da plataforma e imagem do botão do celular</div>
+  <h1>🔐 Admin</h1>
+  <div class="sub">dados gerais do site — atualize a página (F5) pra ver os números de novo</div>
 
-  <div id="telaLogin" class="card">
-    <h2 style="margin-top:0">Entrar</h2>
-    <input type="text" id="campoSenha" placeholder="Senha do admin" style="letter-spacing:2px">
-    <button class="btn-ouro" onclick="entrar()" style="width:100%">Entrar</button>
-    <div class="erro-msg" id="loginErro"></div>
+  <div class="card">
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-num">""" + str(stats['total_acessos']) + """</div><div class="stat-label">acessos totais (desde sempre)</div></div>
+      <div class="stat-box"><div class="stat-num">""" + str(stats['total_salas_criadas']) + """</div><div class="stat-label">salas criadas (desde sempre)</div></div>
+      <div class="stat-box"><div class="stat-num">""" + str(stats['total_passaros_cadastrados']) + """</div><div class="stat-label">pássaros cadastrados (desde sempre)</div></div>
+      <div class="stat-box"><div class="stat-num" id="numDispositivos">--</div><div class="stat-label">celulares conectados agora</div></div>
+    </div>
   </div>
 
-  <div id="telaPainel" style="display:none">
-    <div class="card">
-      <h2 style="margin-top:0">📊 Dados em tempo real</h2>
-      <div class="stat-grid" id="statGrid">
-        <div class="vazio">carregando...</div>
-      </div>
-      <div class="sub" style="margin-top:10px">atualiza a cada 5 segundos</div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin-top:0">🖼️ Imagem do botão do celular</h2>
-      <div class="sub">Substitui o botão azul "SEGURE PARA CANTAR" por uma imagem sua. A imagem é redimensionada automaticamente pra ficar leve e não atrapalhar o app.</div>
-      <div class="preview-botao" id="previewBotao"><span>SEGURE PARA CANTAR</span></div>
-      <input type="file" id="arquivoImagem" accept="image/*" style="margin-bottom:8px">
-      <div class="linha-botoes">
-        <button class="btn-azul" onclick="enviarImagem()">💾 Salvar imagem</button>
-        <button class="btn-cinza" onclick="removerImagem()">↩️ Usar botão padrão</button>
-      </div>
-      <div class="erro-msg" id="imagemErro"></div>
-      <div class="ok-msg" id="imagemOk"></div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin-top:0">🔑 Trocar senha do admin</h2>
-      <input type="password" id="senhaAtual" placeholder="Senha atual">
-      <input type="password" id="senhaNova" placeholder="Nova senha (mín. 4 caracteres)">
-      <button class="btn-roxo" onclick="trocarSenha()" style="width:100%">Trocar senha</button>
-      <div class="erro-msg" id="senhaErro"></div>
-      <div class="ok-msg" id="senhaOk"></div>
-    </div>
-
-    <button class="btn-cinza" onclick="sair()" style="width:100%">Sair</button>
+  <div class="card">
+    <h2 style="margin-top:0">Trocar senha</h2>
+    <form method="POST" action="/admin">
+      <input type="hidden" name="acao" value="trocar_senha">
+      <input type="password" name="senha_atual" placeholder="Senha atual" required>
+      <input type="password" name="nova_senha" placeholder="Nova senha (mín. 4 caracteres)" required>
+      <button class="btn-roxo" type="submit" style="width:100%">Trocar senha</button>
+    </form>
   </div>
 </div>
 <script>
-function mostrar(id, msg, cor) {
-  const el = document.getElementById(id);
-  el.textContent = msg;
-  el.style.display = msg ? 'block' : 'none';
-}
-
-async function verificarStatus() {
+// só isso aqui atualiza sozinho — 1 número, a cada 10s, sem afetar o resto do site
+async function atualizarDispositivos() {
   try {
-    const resp = await fetch('/api/admin/status');
+    const resp = await fetch('/api/admin/dispositivos?senha=' + """ + senha_js + """);
     const data = await resp.json();
-    if (data.ok && data.autenticado) {
-      document.getElementById('telaLogin').style.display = 'none';
-      document.getElementById('telaPainel').style.display = 'block';
-      carregarStats();
-      carregarImagemAtual();
-    }
+    if (data.ok) document.getElementById('numDispositivos').textContent = data.dispositivos_conectados_agora;
   } catch (e) {}
 }
-
-async function entrar() {
-  mostrar('loginErro', '');
-  const senha = document.getElementById('campoSenha').value;
-  try {
-    const resp = await fetch('/api/admin/login', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({senha})
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      document.getElementById('telaLogin').style.display = 'none';
-      document.getElementById('telaPainel').style.display = 'block';
-      carregarStats();
-      carregarImagemAtual();
-    } else {
-      mostrar('loginErro', data.erro || 'senha incorreta');
-    }
-  } catch (e) {
-    mostrar('loginErro', 'sem conexão com o servidor');
-  }
-}
-
-async function sair() {
-  await fetch('/api/admin/logout', {method: 'POST'});
-  location.reload();
-}
-
-const ROTULOS = {
-  total_acessos: 'acessos totais (desde sempre)',
-  total_salas_criadas: 'salas criadas (desde sempre)',
-  salas_no_banco_agora: 'salas guardadas agora',
-  salas_ativas_ultimos_15min: 'salas ativas (15 min)',
-  total_passaros_cadastrados_agora: 'pássaros cadastrados agora',
-  dispositivos_conectados_agora: 'celulares conectados agora',
-};
-
-async function carregarStats() {
-  try {
-    const resp = await fetch('/api/admin/stats');
-    if (resp.status === 401) { location.reload(); return; }
-    const data = await resp.json();
-    if (!data.ok) return;
-    const grid = document.getElementById('statGrid');
-    grid.innerHTML = '';
-    Object.keys(ROTULOS).forEach(chave => {
-      const valor = data.stats[chave] ?? 0;
-      const box = document.createElement('div');
-      box.className = 'stat-box';
-      box.innerHTML = `<div class="stat-num">${valor}</div><div class="stat-label">${ROTULOS[chave]}</div>`;
-      grid.appendChild(box);
-    });
-  } catch (e) {}
-}
-
-async function carregarImagemAtual() {
-  try {
-    const resp = await fetch('/api/config/publico');
-    const data = await resp.json();
-    const preview = document.getElementById('previewBotao');
-    if (data.ok && data.imagem_botao) {
-      preview.style.backgroundImage = `url("${data.imagem_botao}")`;
-      preview.classList.add('tem-imagem');
-    } else {
-      preview.style.backgroundImage = '';
-      preview.classList.remove('tem-imagem');
-    }
-  } catch (e) {}
-}
-
-// redimensiona a imagem no navegador antes de enviar, pra manter o app leve
-function redimensionarImagem(file) {
-  return new Promise((resolve, reject) => {
-    const leitor = new FileReader();
-    leitor.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        const maxLado = 500;
-        let w = img.width, h = img.height;
-        if (w > h && w > maxLado) { h = Math.round(h * maxLado / w); w = maxLado; }
-        else if (h > maxLado) { w = Math.round(w * maxLado / h); h = maxLado; }
-        const canvas = document.createElement('canvas');
-        canvas.width = w; canvas.height = h;
-        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL('image/jpeg', 0.72));
-      };
-      img.onerror = reject;
-      img.src = e.target.result;
-    };
-    leitor.onerror = reject;
-    leitor.readAsDataURL(file);
-  });
-}
-
-async function enviarImagem() {
-  mostrar('imagemErro', ''); mostrar('imagemOk', '');
-  const arquivo = document.getElementById('arquivoImagem').files[0];
-  if (!arquivo) { mostrar('imagemErro', 'escolhe um arquivo de imagem primeiro'); return; }
-  try {
-    const dataUrl = await redimensionarImagem(arquivo);
-    const resp = await fetch('/api/admin/imagem_botao', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({imagem: dataUrl})
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      mostrar('imagemOk', 'imagem salva! já vale pros próximos celulares que abrirem a página.');
-      carregarImagemAtual();
-    } else {
-      mostrar('imagemErro', data.erro || 'erro ao salvar');
-    }
-  } catch (e) {
-    mostrar('imagemErro', 'não consegui processar essa imagem');
-  }
-}
-
-async function removerImagem() {
-  mostrar('imagemErro', ''); mostrar('imagemOk', '');
-  const resp = await fetch('/api/admin/imagem_botao', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({imagem: null})
-  });
-  const data = await resp.json();
-  if (data.ok) { mostrar('imagemOk', 'voltou pro botão padrão.'); carregarImagemAtual(); }
-}
-
-async function trocarSenha() {
-  mostrar('senhaErro', ''); mostrar('senhaOk', '');
-  const senha_atual = document.getElementById('senhaAtual').value;
-  const nova_senha = document.getElementById('senhaNova').value;
-  try {
-    const resp = await fetch('/api/admin/trocar_senha', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({senha_atual, nova_senha})
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      mostrar('senhaOk', 'senha trocada com sucesso.');
-      document.getElementById('senhaAtual').value = '';
-      document.getElementById('senhaNova').value = '';
-    } else {
-      mostrar('senhaErro', data.erro || 'erro ao trocar senha');
-    }
-  } catch (e) {
-    mostrar('senhaErro', 'sem conexão com o servidor');
-  }
-}
-
-verificarStatus();
-setInterval(() => {
-  if (document.getElementById('telaPainel').style.display !== 'none') carregarStats();
-}, 5000);
+atualizarDispositivos();
+setInterval(atualizarDispositivos, 10000);
 </script>
 </body>
 </html>"""
 
 
-@app.route('/admin')
+def admin_autenticado(senha):
+    if not senha:
+        return False
+    try:
+        return db.verificar_senha_admin(senha)
+    except Exception:
+        return False
+
+
+@app.route('/api/admin/dispositivos')
+def api_admin_dispositivos():
+    """Único dado 'ao vivo' do admin — vem da memória (sem consulta ao
+    banco), então é barato mesmo atualizando a cada 10s."""
+    senha = request.args.get('senha', '')
+    if not admin_autenticado(senha):
+        return jsonify({"ok": False}), 401
+    agora = time.time()
+    with conexoes_lock:
+        dispositivos_conectados_agora = sum(
+            1 for c in conexoes.values() if agora - c['ultimo_tick'] <= 10
+        )
+    return jsonify({"ok": True, "dispositivos_conectados_agora": dispositivos_conectados_agora})
+
+
+@app.route('/admin', methods=['GET', 'POST'])
 def tela_admin():
-    return HTML_ADMIN
+    senha = request.values.get('senha', '')
+    erro = None
+
+    if request.method == 'POST' and request.form.get('acao') == 'trocar_senha':
+        senha_atual = request.form.get('senha_atual', '')
+        nova_senha = request.form.get('nova_senha', '')
+        if not admin_autenticado(senha_atual):
+            return _pagina_admin_login('senha atual incorreta')
+        if len(nova_senha) < 4:
+            return _pagina_admin_login('a nova senha precisa ter pelo menos 4 caracteres')
+        try:
+            db.trocar_senha_admin(nova_senha)
+        except Exception:
+            return _pagina_admin_login('banco de dados indisponível agora, tenta de novo em instantes')
+        senha = nova_senha  # segue autenticado com a senha nova
+
+    if not admin_autenticado(senha):
+        return _pagina_admin_login('senha incorreta' if senha else None)
+
+    try:
+        stats = db.obter_estatisticas_gerais()
+    except Exception:
+        return _pagina_admin_login('banco de dados indisponível agora, tenta de novo em instantes')
+
+    return _pagina_admin_painel(stats, senha)
 
 
 if __name__ == '__main__':
