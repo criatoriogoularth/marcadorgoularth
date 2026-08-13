@@ -314,7 +314,24 @@ def classificar(codigo, quantidade):
                    VALUES (%s, 'final', %s, %s, %s, %s)""",
                 (codigo, item['nome'], item['anilha'], item['proprietario'], item['id'])
             )
-    return len(classificados)
+        # ao classificar pra final, qualquer celular que ainda estivesse
+        # vinculado a um pássaro da eliminatória é desvinculado automaticamente
+        # — sem isso ele ficava "preso" no pássaro antigo e não tinha como
+        # escolher um pássaro da final sem o organizador avisar pra apertar
+        # "trocar pássaro vinculado" na mão.
+        cur.execute(
+            "SELECT esp32_id FROM itens WHERE sala_codigo = %s AND tipo = 'eliminatorias' AND esp32_id IS NOT NULL",
+            (codigo,)
+        )
+        vinculados_elim = [l['esp32_id'] for l in cur.fetchall()]
+        if vinculados_elim:
+            cur.execute(
+                "UPDATE itens SET esp32_id = NULL WHERE sala_codigo = %s AND tipo = 'eliminatorias' AND esp32_id IS NOT NULL",
+                (codigo,)
+            )
+    # devolve também quem tava vinculado (pra quem chamou limpar o cache
+    # em memória e avisar cada celular pra voltar a tela de escolher pássaro)
+    return len(classificados), vinculados_elim
 
 
 # ════════════════════════════════════════════════════════════════════

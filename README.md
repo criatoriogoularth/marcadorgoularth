@@ -95,6 +95,12 @@ várias coisas o tempo todo) pra não pesar no resto do site.
 
 ## O que mudou nesta versão (última atualização)
 
+- **Bug corrigido: celular ficava "preso" no pássaro da eliminatória depois
+  de classificar pra final.** Agora, ao apertar **Classificar para Final**,
+  todo celular que ainda estava vinculado a um pássaro da eliminatória é
+  desvinculado automaticamente e volta sozinho pra tela de escolher pássaro
+  — já pronto pra escolher um pássaro da final, sem precisar o organizador
+  avisar pra apertar "trocar pássaro vinculado" na mão.
 - **Delay entre celular e site bem menor**: antes, cada "tick" do celular
   (10x por segundo) fazia até 3 idas ao banco antes de gravar o tempo
   (checar se a sala existe, "tocar" ela, e um SELECT+JOIN pra descobrir de

@@ -201,7 +201,14 @@ def api_classificar(codigo):
     except (TypeError, ValueError):
         qtd = db.obter_quantidade_classificados(codigo)
     qtd = max(0, qtd)
-    total = db.classificar(codigo, qtd)
+    total, vinculados_elim = db.classificar(codigo, qtd)
+    # libera (no cache em memória também) os celulares que estavam vinculados
+    # a pássaros da eliminatória, e avisa cada um pra voltar pra tela de
+    # escolher pássaro — agora já pode escolher um da final
+    for esp32_id in vinculados_elim:
+        limpar_vinculo_cache(esp32_id)
+    for esp32_id in vinculados_elim:
+        empurrar_comandos(esp32_id, ["DESVINCULAR"])
     return jsonify({"ok": True, "classificados": total})
 
 
@@ -1139,6 +1146,14 @@ function processarComando(msg) {
     isRunning = false; botaoBloqueado = true; faseAtual = 2; syncAtiva = false;
     document.getElementById('lcdLinha0').textContent = 'PROVA FINALIZADA';
     document.getElementById('lcdLinha1').textContent = 'FINALIZADA';
+
+  } else if (/^desvincular$/i.test(msg)) {
+    // o organizador já desvinculou esse celular no servidor (ex: ao
+    // classificar pra final) — o pássaro da eliminatória não é mais dele,
+    // então volta sozinho pra tela de escolher pássaro (agora já pode
+    // escolher um da final)
+    voltarParaTelaVincular();
+    return; // já trocou de tela, não precisa passar por atualizarBotao()
   }
   atualizarBotao();
 }
@@ -1271,6 +1286,15 @@ async function vincularPassaro(tipo, itemId) {
   }
 }
 
+function voltarParaTelaVincular() {
+  passaroAtual = null;
+  faseAtual = 0; botaoBloqueado = true; provaIniciada = false; isRunning = false;
+  totalTime = 0; startTime = 0; syncAtiva = false; nomePassaroAtual = '';
+  document.getElementById('telaMarcador').style.display = 'none';
+  document.getElementById('telaVincular').style.display = 'block';
+  carregarPassaros();
+}
+
 async function trocarPassaro() {
   if (passaroAtual) {
     try {
@@ -1280,12 +1304,7 @@ async function trocarPassaro() {
       });
     } catch (e) {}
   }
-  passaroAtual = null;
-  faseAtual = 0; botaoBloqueado = true; provaIniciada = false; isRunning = false;
-  totalTime = 0; startTime = 0; syncAtiva = false; nomePassaroAtual = '';
-  document.getElementById('telaMarcador').style.display = 'none';
-  document.getElementById('telaVincular').style.display = 'block';
-  carregarPassaros();
+  voltarParaTelaVincular();
 }
 
 let wakeLock = null;
