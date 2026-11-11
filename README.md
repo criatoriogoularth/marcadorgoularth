@@ -93,7 +93,33 @@ várias coisas o tempo todo) pra não pesar no resto do site.
   aba do admin estiver aberta — não afeta a tela do organizador nem a do
   celular.
 
-## O que mudou nesta versão (última atualização)
+## Deploy
+
+Guia completo (Render e VPS com HTTPS e vários sites) em **[DEPLOY.md](DEPLOY.md)**.
+Arquivos: `Dockerfile`, `render.yaml`, `deploy/vps/`, `.env.example`.
+
+## Novidades desta versão
+
+- **Visual renovado:** novo logo, tipografia do sistema (sem depender de fontes externas),
+  cartões e botões refinados, foco visível nos campos e emojis removidos dos cabeçalhos.
+- **Segurança:** a senha inicial do `/admin` agora vem de `ADMIN_SENHA_INICIAL` (antes era sempre `123456`).
+  `DB_SSLMODE` permite usar Postgres local (VPS) além do Neon.
+
+
+- **Delay entre celular e site: corrigido de vez.** O tick do celular não grava mais
+  no banco a cada 100ms: o tempo ao vivo fica na memória do servidor, o organizador
+  lê dali (atualiza a cada 500ms) e o Neon recebe tudo em lote a cada ~1s (e sempre
+  antes de finalizar, classificar, gerar resultado geral ou finalizar por tempo).
+  **Precisa de `--workers 1`** no gunicorn (já é o do Start Command acima) — com mais
+  de um worker cada um teria uma memória diferente.
+- **Agora é um app instalável (PWA).** No celular, abra o site e use
+  *Adicionar à tela inicial* (Android/Chrome: menu ⋮ → "Instalar app"; iPhone/Safari:
+  Compartilhar → "Adicionar à Tela de Início"). Abre em tela cheia, com ícone próprio.
+  O service worker nunca guarda dados (`/api` e as telas vão sempre pela rede); só
+  guarda os ícones e mostra uma tela de "sem conexão" se a internet cair ao abrir.
+  Arquivos: `static/` (ícones), e as rotas `/manifest.json` e `/sw.js` em `app.py`.
+
+## Versão anterior (2)
 
 - **Bug corrigido: celular ficava "preso" no pássaro da eliminatória depois
   de classificar pra final.** Agora, ao apertar **Classificar para Final**,

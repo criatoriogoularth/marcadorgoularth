@@ -1,0 +1,43 @@
+# App do marcador. Roda na rede "web", compartilhada com o Caddy (que cuida do HTTPS).
+# Uso (dentro de /opt/marcador, com o projeto clonado em ./app e o .env ao lado):
+#   docker compose up -d --build
+services:
+  marcador:
+    build: ./app
+    container_name: marcador
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    networks: [web]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ── OPCIONAL: Postgres local (em vez do Neon). Ative com:  docker compose --profile db-local up -d
+  # Depois use no .env:  DATABASE_URL=postgresql://marcador:SUASENHA@db:5432/marcador  e  DB_SSLMODE=disable
+  db:
+    profiles: ["db-local"]
+    image: postgres:16-alpine
+    container_name: marcador-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: marcador
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-troque}
+      POSTGRES_DB: marcador
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [web]
+
+volumes:
+  pgdata:
+
+networks:
+  web:
+    external: true

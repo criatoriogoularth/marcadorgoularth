@@ -1,0 +1,35 @@
+# Um bloco por site. Cada domínio precisa de um registro DNS tipo A apontando pro IP da VPS.
+# Troque os domínios de exemplo pelos seus.
+
+# ── Marcador (este projeto) ──
+marcador.seudominio.com {
+	encode zstd gzip
+	reverse_proxy marcador:8000
+}
+
+# ── Sites estáticos (HTML/CSS/JS, ou o "dist" de um build) ──
+# Coloque os arquivos em /srv/sites/site1, /srv/sites/site2 ...
+site1.seudominio.com {
+	root * /srv/sites/site1
+	encode zstd gzip
+	try_files {path} /index.html
+	file_server
+}
+
+site2.seudominio.com {
+	root * /srv/sites/site2
+	encode zstd gzip
+	try_files {path} /index.html
+	file_server
+}
+
+# ── Site que roda como app (Node, Python...) em outro container da rede "web" ──
+# site3.seudominio.com {
+# 	encode zstd gzip
+# 	reverse_proxy nome-do-container:3000
+# }
+
+# www -> sem www (exemplo)
+# www.seudominio.com {
+# 	redir https://seudominio.com{uri} permanent
+# }

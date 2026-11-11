@@ -1,0 +1,18 @@
+# Blueprint do Render: "New +" -> "Blueprint" -> escolha o repositório.
+services:
+  - type: web
+    name: marcador-goularth
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --worker-class gthread --workers 1 --threads 16 --bind 0.0.0.0:$PORT --timeout 60
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        sync: false        # cole a connection string do Neon no painel
+      - key: ADMIN_SENHA_INICIAL
+        sync: false
+      - key: DB_SSLMODE
+        value: require

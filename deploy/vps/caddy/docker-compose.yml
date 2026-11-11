@@ -1,0 +1,26 @@
+# Caddy: porta de entrada de TODOS os seus sites. Emite e renova o HTTPS sozinho.
+# Uso (em /opt/caddy):  docker compose up -d      |  recarregar após editar o Caddyfile:
+#   docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+services:
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/sites:/srv/sites:ro        # pastas dos sites estáticos
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [web]
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  web:
+    external: true

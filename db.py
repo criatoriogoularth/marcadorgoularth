@@ -38,7 +38,7 @@ def _obter_pool():
                 # quando várias pessoas estão marcando ao mesmo tempo — isso
                 # era uma das causas do delay entre o celular e a tela do
                 # organizador.
-                _pool = ThreadedConnectionPool(1, 20, DATABASE_URL, sslmode='require')
+                _pool = ThreadedConnectionPool(1, 20, DATABASE_URL, sslmode=os.environ.get('DB_SSLMODE', 'require'))
     return _pool
 
 
@@ -122,7 +122,7 @@ def inicializar_schema():
             from werkzeug.security import generate_password_hash
             cur.execute(
                 "INSERT INTO config (chave, valor) VALUES ('admin_senha_hash', %s)",
-                (generate_password_hash('123456'),)
+                (generate_password_hash(os.environ.get('ADMIN_SENHA_INICIAL', '123456')),)
             )
 
 
@@ -429,6 +429,23 @@ def gravar_tempo(item_id, tempo_texto, tempo_segundos):
         cur.execute(
             "UPDATE itens SET tempo_texto = %s, tempo_segundos = %s WHERE id = %s",
             (tempo_texto, tempo_segundos, item_id)
+        )
+
+
+def gravar_tempos_lote(linhas):
+    """Grava vários tempos de uma vez só (1 ida ao banco, 1 commit).
+    linhas = [(item_id, tempo_texto, tempo_segundos), ...]"""
+    if not linhas:
+        return
+    with conexao() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            """UPDATE itens AS i
+               SET tempo_texto = v.t, tempo_segundos = v.s
+               FROM (VALUES %s) AS v(id, t, s)
+               WHERE i.id = v.id""",
+            linhas,
+            template="(%s::int, %s::text, %s::double precision)"
         )
 
 

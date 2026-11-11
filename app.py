@@ -30,6 +30,46 @@ conexoes_lock = threading.Lock()
 conexoes = {}
 
 
+# ── TEMPO AO VIVO (memória) ─────────────────────────────────────────
+# O tick do celular (10x/s) grava aqui, NÃO no banco. A tela do organizador
+# lê daqui por cima do que veio do banco, então o tempo aparece quase em
+# tempo real. O banco recebe tudo em lote, de ~1 em 1 segundo (e sempre
+# antes de finalizar/classificar/ranking), então nada se perde.
+# Requer --workers 1 no gunicorn (já é o que o README manda usar).
+live_lock = threading.Lock()
+live_tempos = {}   # item_id -> {"t": texto, "s": segundos, "sujo": bool, "em": ts}
+
+
+def registrar_tempo_live(item_id, texto, segundos):
+    with live_lock:
+        live_tempos[item_id] = {"t": texto, "s": segundos, "sujo": True, "em": time.time()}
+
+
+def flush_tempos():
+    """Manda pro banco, em lote, todos os tempos que mudaram."""
+    with live_lock:
+        sujos = [(iid, d["t"], d["s"]) for iid, d in live_tempos.items() if d["sujo"]]
+        for iid, _, _ in sujos:
+            live_tempos[iid]["sujo"] = False
+    if not sujos:
+        return
+    try:
+        db.gravar_tempos_lote(sujos)
+    except Exception as e:
+        print(f"⚠ erro ao gravar lote de tempos: {e}")
+        with live_lock:   # tenta de novo no próximo ciclo
+            for iid, t, s in sujos:
+                d = live_tempos.get(iid)
+                if d and d["t"] == t:
+                    d["sujo"] = True
+
+
+def _flusher():
+    while True:
+        time.sleep(1)
+        flush_tempos()
+
+
 def _entrada_padrao():
     return {"fila_saida": [], "ultimo_tick": time.time(), "vinculo": None, "ativa": False}
 
@@ -134,6 +174,13 @@ def api_ver_prova(codigo, tipo):
         }
         for it in resultado['itens']
     ]
+    with live_lock:
+        for it in itens:
+            d = live_tempos.get(it["id"])
+            if d:
+                it["tempo_texto"] = d["t"]
+                it["tempo_segundos"] = d["s"]
+    itens.sort(key=lambda x: (-x["tempo_segundos"], x["id"]))
     return jsonify({
         "ok": True,
         "ativa": prova['ativa'],
@@ -164,6 +211,7 @@ def api_finalizar_prova(codigo, tipo):
     codigo = codigo.upper()
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
+    flush_tempos()
     vinculados = db.finalizar_prova(codigo, tipo)
     marcar_prova_ativa_para(vinculados, False)
     for esp32_id in vinculados:
@@ -201,6 +249,7 @@ def api_classificar(codigo):
     except (TypeError, ValueError):
         qtd = db.obter_quantidade_classificados(codigo)
     qtd = max(0, qtd)
+    flush_tempos()
     total, vinculados_elim = db.classificar(codigo, qtd)
     # libera (no cache em memória também) os celulares que estavam vinculados
     # a pássaros da eliminatória, e avisa cada um pra voltar pra tela de
@@ -314,10 +363,7 @@ def api_tick(codigo):
             # grava direto, sem nenhuma consulta antes
             if ativa:
                 tempo_seg = db.tempo_para_segundos(tempo_str)
-                try:
-                    db.gravar_tempo(vinculo["item_id"], tempo_str, tempo_seg)
-                except Exception:
-                    pass
+                registrar_tempo_live(vinculo["item_id"], tempo_str, tempo_seg)
         else:
             # sem cache ainda — confirma no banco uma vez só, e guarda o
             # resultado em cache pras próximas chamadas desse celular
@@ -344,6 +390,7 @@ def api_ranking_geral(codigo):
     codigo = codigo.upper()
     if not db.sala_existe(codigo):
         return jsonify({"ok": False}), 404
+    flush_tempos()
     ranking = db.ranking_geral(codigo)
     return jsonify({"ok": True, "ranking": ranking})
 
@@ -363,6 +410,7 @@ def api_status_provas(codigo):
 def _reaper():
     while True:
         time.sleep(2)
+        flush_tempos()
         try:
             for vencida in db.provas_para_finalizar_automaticamente():
                 marcar_prova_ativa_para(vencida['vinculados'], False)
@@ -385,6 +433,10 @@ def _reaper():
             mortas = [eid for eid, c in conexoes.items() if agora - c['ultimo_tick'] > 3600]
             for eid in mortas:
                 del conexoes[eid]
+        with live_lock:
+            velhos = [i for i, d in live_tempos.items() if not d["sujo"] and agora - d["em"] > 10800]
+            for i in velhos:
+                del live_tempos[i]
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -394,6 +446,7 @@ def _reaper():
 try:
     db.inicializar_schema()
     threading.Thread(target=_reaper, daemon=True).start()
+    threading.Thread(target=_flusher, daemon=True).start()
     print("✅ Banco de dados conectado e schema verificado.")
 except Exception as e:
     print(f"⚠ AVISO: não consegui conectar/inicializar o banco de dados agora: {e}")
@@ -401,37 +454,69 @@ except Exception as e:
 
 
 ESTILO_BASE = """
-* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-body { background:#0B1629; font-family:'Trebuchet MS', Arial, sans-serif; color:#EAF1FF; min-height:100vh; }
-a { color:inherit; }
-.wrap { max-width:760px; margin:0 auto; padding:18px; }
-h1 { color:#F0C030; font-size:20px; margin-bottom:4px; }
-h2 { color:#F0C030; font-size:15px; margin:16px 0 8px; }
-.sub { color:#93a4c3; font-size:12px; margin-bottom:14px; }
-.card { background:#16213d; border-radius:12px; padding:16px; margin-bottom:12px; border-left:4px solid #C9980E; }
-input[type=text], input[type=number] {
-  width:100%; padding:12px; border-radius:8px; border:1px solid #2a3a63; background:#0f1830;
-  color:#EAF1FF; font-size:15px; margin-bottom:8px;
+:root {
+  --fundo:#0B1629; --fundo2:#0f1b33; --card:#121d37; --borda:#22315a; --borda2:#2a3a63;
+  --texto:#EAF1FF; --mudo:#93a4c3; --apagado:#5a6d94;
+  --ouro:#F0C030; --ouro2:#C9980E;
+  --raio:14px;
+  --sans:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --mono:ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, 'Roboto Mono', monospace;
 }
-button { cursor:pointer; border:none; border-radius:10px; font-weight:bold; padding:12px 16px; font-size:14px; }
-.btn-ouro { background:#F0C030; color:#0B1629; }
-.btn-azul { background:#1558B0; color:white; }
-.btn-verde { background:#177A38; color:white; }
-.btn-vermelho { background:#B0271A; color:white; }
-.btn-roxo { background:#6025A8; color:white; }
-.btn-cinza { background:#2a3a63; color:#c9d6f0; }
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+html { -webkit-text-size-adjust:100%; }
+body { background:radial-gradient(1200px 600px at 50% -200px, #14264a 0%, var(--fundo) 60%) no-repeat, var(--fundo);
+       font-family:var(--sans); color:var(--texto); min-height:100vh; line-height:1.45;
+       -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums; }
+a { color:inherit; }
+.wrap { max-width:760px; margin:0 auto; padding:20px 18px 32px; }
+h1 { color:#fff; font-size:21px; font-weight:700; letter-spacing:-.01em; margin-bottom:4px; }
+h2 { color:#fff; font-size:16px; font-weight:650; letter-spacing:-.005em; margin:18px 0 8px; }
+.sub { color:var(--mudo); font-size:13px; margin-bottom:14px; }
+.card { background:var(--card); border:1px solid var(--borda); border-radius:var(--raio); padding:18px;
+        margin-bottom:14px; box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 24px rgba(0,0,0,.25); }
+input[type=text], input[type=number], input[type=password] {
+  width:100%; padding:13px 14px; border-radius:10px; border:1px solid var(--borda2); background:var(--fundo2);
+  color:var(--texto); font-size:16px; font-family:inherit; margin-bottom:8px; outline:none;
+  transition:border-color .15s, box-shadow .15s;
+}
+input::placeholder { color:var(--apagado); }
+input:focus { border-color:var(--ouro); box-shadow:0 0 0 3px rgba(240,192,48,.18); }
+button { cursor:pointer; border:none; border-radius:10px; font-family:inherit; font-weight:650; padding:12px 16px;
+         font-size:14px; transition:filter .15s, transform .08s, background .15s; }
+button:hover { filter:brightness(1.08); }
+button:not(.botao-canto):active { transform:translateY(1px); }
+button:disabled:not(.botao-canto) { opacity:.5; cursor:not-allowed; filter:none; }
+:focus-visible { outline:2px solid var(--ouro); outline-offset:2px; }
+.btn-ouro { background:linear-gradient(180deg,#F5CB4A,#E8B722); color:#0B1629; }
+.btn-azul { background:#1a62c4; color:white; }
+.btn-verde { background:#1b8541; color:white; }
+.btn-vermelho { background:#c22d1f; color:white; }
+.btn-roxo { background:#6a2cb8; color:white; }
+.btn-cinza { background:var(--borda2); color:#c9d6f0; }
 .linha-botoes { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
 table { width:100%; border-collapse:collapse; margin-top:8px; }
-th, td { text-align:left; padding:8px 6px; border-bottom:1px solid #223154; font-size:13px; }
-th { color:#93a4c3; font-weight:normal; }
-.tag { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:bold; }
-.tag-ok { background:#177A38; color:white; }
-.tag-nao { background:#2a3a63; color:#93a4c3; }
+th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #1d2b4d; font-size:13px; }
+th { color:var(--mudo); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+tbody tr:hover td { background:rgba(255,255,255,.02); }
+.tag { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:700; }
+.tag-ok { background:#1b8541; color:white; }
+.tag-nao { background:var(--borda2); color:var(--mudo); }
 .tabs { display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
-.tab-btn { background:#16213d; color:#93a4c3; border-radius:8px; padding:10px 14px; font-size:13px; }
-.tab-btn.ativa { background:#F0C030; color:#0B1629; }
-.vazio { text-align:center; color:#5a6d94; padding:14px; font-size:13px; }
-.codigo-sala { font-family:monospace; font-size:22px; letter-spacing:3px; color:#F0C030; font-weight:bold; }
+.tab-btn { background:var(--card); border:1px solid var(--borda); color:var(--mudo); border-radius:9px; padding:10px 14px; font-size:13px; }
+.tab-btn.ativa { background:var(--ouro); border-color:var(--ouro); color:#0B1629; }
+.vazio { text-align:center; color:var(--apagado); padding:16px; font-size:13px; }
+.codigo-sala { font-family:var(--mono); font-size:22px; letter-spacing:3px; color:var(--ouro); font-weight:700; }
+
+/* ── marca (logo + nome) ── */
+.marca { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+.marca svg { width:42px; height:42px; flex:none; filter:drop-shadow(0 4px 10px rgba(240,192,48,.25)); }
+.marca-nome { font-size:17px; font-weight:750; letter-spacing:-.01em; color:#fff; line-height:1.15; }
+.marca-sub { font-size:12px; color:var(--mudo); margin-top:2px; }
+.hero { margin:10px 0 22px; }
+.hero h1 { font-size:26px; line-height:1.15; margin:18px 0 8px; }
+.hero p { color:var(--mudo); font-size:14px; max-width:46ch; }
+.rodape { text-align:center; color:var(--apagado); font-size:12px; margin-top:26px; }
+@media (prefers-reduced-motion:reduce) { * { transition:none !important; } }
 """
 
 
@@ -440,28 +525,33 @@ HTML_HOME = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Marcador Digital Goularth - Web</title>
+<title>Marcador Digital Goularth</title>
+<meta name="description" content="Cronômetro online para provas de canto: celular como marcador e painel ao vivo para o organizador.">
 <style>""" + ESTILO_BASE + """</style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🐦 Marcador Digital Goularth</h1>
-  <div class="sub">versão web — cronômetro de provas</div>
+  <div class="marca"><svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="#0B1629" stroke="#22315a"/><rect x="21" y="5.5" width="6" height="4" rx="1" fill="#F0C030"/><rect x="18" y="4" width="12" height="2" rx="1" fill="#F0C030"/><circle cx="24" cy="27" r="14.5" fill="#F0C030"/><circle cx="24" cy="27" r="11.6" fill="#0B1629"/><path d="M24 27V18.5M24 27l6 2.4" stroke="#F0C030" stroke-width="2.4" stroke-linecap="round" fill="none"/><circle cx="24" cy="27" r="1.9" fill="#F0C030"/></svg><div><div class="marca-nome">Marcador Digital Goularth</div><div class="marca-sub">Cronômetro para provas de canto</div></div></div>
+  <div class="hero">
+    <h1>Cronometragem de provas,<br>direto do celular.</h1>
+    <p>Crie uma sala, vincule cada pássaro a um celular e acompanhe os tempos ao vivo no painel do organizador.</p>
+  </div>
 
   <div class="card">
     <h2 style="margin-top:0">Criar uma sala nova</h2>
     <div class="sub">Você é o organizador: cadastro fica salvo no seu navegador.</div>
-    <button class="btn-ouro" onclick="criarSala()" style="width:100%">➕ Criar nova sala</button>
+    <button class="btn-ouro" onclick="criarSala()" style="width:100%">Criar nova sala</button>
   </div>
 
   <div class="card">
     <h2 style="margin-top:0">Já tenho uma sala</h2>
     <input type="text" id="codigoEntrar" placeholder="Código da sala (ex: AB12CD)" maxlength="6" style="text-transform:uppercase">
     <div class="linha-botoes">
-      <button class="btn-azul" onclick="entrarComoOrganizador()">🧑‍💻 Entrar como organizador</button>
-      <button class="btn-roxo" onclick="entrarComoCelular()">📟 Entrar como celular-ESP32</button>
+      <button class="btn-azul" onclick="entrarComoOrganizador()">Entrar como organizador</button>
+      <button class="btn-roxo" onclick="entrarComoCelular()">Entrar como celular</button>
     </div>
   </div>
+  <div class="rodape">Marcador Digital Goularth</div>
 </div>
 <script>
 async function criarSala() {
@@ -505,11 +595,11 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Marcador Digital Goularth - Organizador</title>
+<title>Organizador · Marcador Digital Goularth</title>
 <style>""" + ESTILO_BASE + """
 .faixa-codigo { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
 .relogio { text-align:center; margin:6px 0 16px; }
-.relogio-numero { font-family:monospace; font-size:44px; color:#F0C030; font-weight:bold; letter-spacing:1px; }
+.relogio-numero { font-family:var(--mono); font-size:44px; color:#F0C030; font-weight:bold; letter-spacing:1px; }
 .relogio-legenda { color:#93a4c3; font-size:12px; }
 .relogio.acabando .relogio-numero { color:#B0271A; }
 .aviso-offline { background:#4a1414; border:1px solid #B0271A; color:#ffd0cc; padding:10px 12px;
@@ -521,10 +611,9 @@ HTML_ORGANIZADOR = """<!DOCTYPE html>
 <div class="wrap">
   <div class="faixa-codigo">
     <div>
-      <h1 style="margin-bottom:2px">🐦 Marcador Digital Goularth</h1>
-      <div class="sub">sala <span class="codigo-sala" id="codigoTopo">------</span></div>
+      <div class="marca"><svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="#0B1629" stroke="#22315a"/><rect x="21" y="5.5" width="6" height="4" rx="1" fill="#F0C030"/><rect x="18" y="4" width="12" height="2" rx="1" fill="#F0C030"/><circle cx="24" cy="27" r="14.5" fill="#F0C030"/><circle cx="24" cy="27" r="11.6" fill="#0B1629"/><path d="M24 27V18.5M24 27l6 2.4" stroke="#F0C030" stroke-width="2.4" stroke-linecap="round" fill="none"/><circle cx="24" cy="27" r="1.9" fill="#F0C030"/></svg><div><div class="marca-nome">Marcador Digital Goularth</div><div class="marca-sub">sala <span class="codigo-sala" id="codigoTopo" style="font-size:15px;letter-spacing:2px">------</span></div></div></div>
     </div>
-    <button class="btn-roxo" onclick="copiarLinkCelular()">📟 Link do celular</button>
+    <button class="btn-roxo" onclick="copiarLinkCelular()">Link do celular</button>
   </div>
 
   <div class="aviso-offline" id="avisoOffline">
@@ -798,7 +887,7 @@ async function atualizarProva() {
         const tr = document.createElement('tr');
         tr.innerHTML = `<td>${item.nome}</td><td>${item.anilha || ''}</td><td>${item.proprietario || ''}</td>
           <td><span class="tag ${item.vinculado ? 'tag-ok' : 'tag-nao'}">${item.vinculado ? 'sim' : 'não'}</span></td>
-          <td style="font-family:monospace">${item.tempo_texto}</td>`;
+          <td style="font-family:var(--mono)">${item.tempo_texto}</td>`;
         tbody.appendChild(tr);
       });
     }
@@ -859,8 +948,8 @@ function renderGeral() {
   lista.forEach(r => {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${r.posicao}º</td><td>${r.nome}</td><td>${r.anilha || ''}</td><td>${r.proprietario || ''}</td>
-      <td style="font-family:monospace">${r.tempo_eliminatoria_texto}</td>
-      <td style="font-family:monospace">${r.tempo_final_texto}</td>`;
+      <td style="font-family:var(--mono)">${r.tempo_eliminatoria_texto}</td>
+      <td style="font-family:var(--mono)">${r.tempo_final_texto}</td>`;
     tbody.appendChild(tr);
   });
 }
@@ -891,7 +980,7 @@ function gerarImagemResultado() {
   // cabeçalho
   ctx.fillStyle = '#F0C030';
   ctx.font = 'bold 24px Arial';
-  ctx.fillText('🐦 Marcador Digital Goularth', 20, 38);
+  ctx.fillText('Marcador Digital Goularth', 20, 38);
   ctx.fillStyle = '#93a4c3';
   ctx.font = '13px Arial';
   ctx.fillText('Resultado Geral — sala ' + codigo, 20, 60);
@@ -978,7 +1067,7 @@ async function sincronizarFundo() {
 
 setInterval(() => {
   if (telaAtual === 'eliminatorias' || telaAtual === 'final') atualizarProva();
-}, 1000);
+}, 500);
 // interpolação local do relógio grande — atualiza a cada 100ms (com
 // milissegundos) sem precisar bater no servidor a essa frequência
 setInterval(() => {
@@ -1009,16 +1098,16 @@ HTML_CELULAR = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
-<title>Celular como ESP32</title>
+<title>Marcador · Celular</title>
 <style>""" + ESTILO_BASE + """
   body { user-select:none; }
   .cat-titulo { color:#F0C030; font-weight:bold; font-size:14px; margin:14px 0 8px; }
   .bolinha { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; background:#ef4444; }
   .bolinha.ok { background:#10b981; }
   .lcd { background:#000; border-radius:14px; padding:14px 12px; margin-bottom:14px; border:3px solid #223; }
-  .lcd-linha0 { color:#F0C030; font-family:monospace; font-size:20px; text-align:center;
+  .lcd-linha0 { color:#F0C030; font-family:var(--mono); font-size:20px; text-align:center;
                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .lcd-linha1 { color:#3ddc84; font-family:monospace; font-size:34px; text-align:center; margin-top:6px; letter-spacing:1px; }
+  .lcd-linha1 { color:#3ddc84; font-family:var(--mono); font-size:34px; text-align:center; margin-top:6px; letter-spacing:1px; }
   /* o botão de cantar ocupa o resto da tela (min-height em vh) — fica bem
      grande e não deixa espaço embaixo dele pra encostar em outro botão */
   .botao-canto { width:100%; min-height:42vh; border-radius:24px; border:none; font-weight:bold; font-size:22px;
@@ -1034,8 +1123,7 @@ HTML_CELULAR = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <h1>📟 Celular como ESP32</h1>
-  <div class="sub">sala <span class="codigo-sala" id="codigoTopo" style="font-size:15px;">------</span></div>
+  <div class="marca"><svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="#0B1629" stroke="#22315a"/><rect x="21" y="5.5" width="6" height="4" rx="1" fill="#F0C030"/><rect x="18" y="4" width="12" height="2" rx="1" fill="#F0C030"/><circle cx="24" cy="27" r="14.5" fill="#F0C030"/><circle cx="24" cy="27" r="11.6" fill="#0B1629"/><path d="M24 27V18.5M24 27l6 2.4" stroke="#F0C030" stroke-width="2.4" stroke-linecap="round" fill="none"/><circle cx="24" cy="27" r="1.9" fill="#F0C030"/></svg><div><div class="marca-nome">Marcador</div><div class="marca-sub">sala <span class="codigo-sala" id="codigoTopo" style="font-size:15px;letter-spacing:2px">------</span></div></div></div>
   <div class="sub"><span class="bolinha" id="bolinhaStatus"></span><span id="textoStatus">conectando...</span></div>
 
   <div id="telaVincular">
@@ -1417,7 +1505,7 @@ def _pagina_admin_painel(stats, senha):
 <style>""" + ESTILO_BASE + """
   .stat-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
   .stat-box { background:#0f1830; border-radius:10px; padding:14px; text-align:center; }
-  .stat-num { font-size:26px; font-weight:bold; color:#F0C030; font-family:monospace; }
+  .stat-num { font-size:26px; font-weight:bold; color:#F0C030; font-family:var(--mono); }
   .stat-label { font-size:11px; color:#93a4c3; margin-top:4px; }
   .ok-msg { color:#3ddc84; font-size:13px; margin-top:6px; }
   .erro-msg { color:#ff6b6b; font-size:13px; margin-top:6px; }
@@ -1514,6 +1602,108 @@ def tela_admin():
         return _pagina_admin_login('banco de dados indisponível agora, tenta de novo em instantes')
 
     return _pagina_admin_painel(stats, senha)
+
+
+# ════════════════════════════════════════════════════════════════════
+# PWA (site instalável: "Adicionar à tela inicial")
+# ════════════════════════════════════════════════════════════════════
+# Service worker propositalmente simples: NUNCA guarda /api nem as telas
+# (os dados vêm sempre do servidor, ao vivo). Só guarda os ícones e uma
+# página de "sem conexão" pra quando a internet cai ao abrir o app.
+
+PWA_HEAD = """
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0B1629">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Marcador">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+</script>
+"""
+
+MANIFEST = {
+    "name": "Marcador Digital Goularth",
+    "short_name": "Marcador",
+    "description": "Cronômetro de provas de canto — celular como marcador",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#0B1629",
+    "theme_color": "#0B1629",
+    "lang": "pt-BR",
+    "icons": [
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        {"src": "/static/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    ],
+}
+
+SERVICE_WORKER_JS = """
+const CACHE = 'marcador-v1';
+const OFFLINE_HTML = '<!DOCTYPE html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+  + '<body style="background:#0B1629;color:#EAF1FF;font-family:Arial,sans-serif;text-align:center;padding:48px 20px">'
+  + '<h2 style="color:#F0C030">Sem conexão</h2><p>Conecte-se à internet e tente de novo.</p>'
+  + '<button onclick="location.reload()" style="margin-top:20px;padding:12px 20px;border:0;border-radius:10px;'
+  + 'background:#F0C030;font-weight:bold">Tentar de novo</button>';
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll([
+    '/static/icon-192.png', '/static/icon-512.png', '/static/apple-touch-icon.png'
+  ])));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))
+    .then(() => self.clients.claim()));
+});
+
+self.addEventListener('fetch', e => {
+  const req = e.request;
+  const url = new URL(req.url);
+  if (req.method !== 'GET' || url.origin !== location.origin) return;   // POST/tick/API: direto na rede
+  if (url.pathname.startsWith('/api/')) return;                          // dados sempre ao vivo
+  if (req.mode === 'navigate') {                                         // telas: rede primeiro
+    e.respondWith(fetch(req).catch(() => new Response(OFFLINE_HTML, {headers: {'Content-Type': 'text/html; charset=utf-8'}})));
+    return;
+  }
+  if (url.pathname.startsWith('/static/')) {                             // ícones: cache primeiro
+    e.respondWith(caches.match(req).then(r => r || fetch(req)));
+  }
+});
+"""
+
+
+@app.route('/healthz')
+def healthz():
+    """Usado pelo Docker/Render pra saber se o app está de pé (não consulta o banco)."""
+    return jsonify({"ok": True})
+
+
+@app.route('/manifest.json')
+def pwa_manifest():
+    resp = jsonify(MANIFEST)
+    resp.headers['Content-Type'] = 'application/manifest+json'
+    return resp
+
+
+@app.route('/sw.js')
+def pwa_sw():
+    resp = app.response_class(SERVICE_WORKER_JS, mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache'   # o navegador sempre confere se há versão nova
+    return resp
+
+
+# injeta as tags da PWA nas 3 telas principais (admin fica de fora de propósito)
+HTML_HOME = HTML_HOME.replace('</head>', PWA_HEAD + '</head>', 1)
+HTML_ORGANIZADOR = HTML_ORGANIZADOR.replace('</head>', PWA_HEAD + '</head>', 1)
+HTML_CELULAR = HTML_CELULAR.replace('</head>', PWA_HEAD + '</head>', 1)
 
 
 if __name__ == '__main__':
