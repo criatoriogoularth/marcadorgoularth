@@ -40,6 +40,49 @@ live_lock = threading.Lock()
 live_tempos = {}   # item_id -> {"t": texto, "s": segundos, "sujo": bool, "em": ts}
 
 
+# ── CACHE DA ESTRUTURA DA PROVA ─────────────────────────────────────
+# A tela do organizador pergunta "como está a prova?" várias vezes por
+# segundo. Pra não ir ao Neon toda vez, guardamos o resultado por poucos
+# segundos. Qualquer alteração (POST/PUT/DELETE em /api, exceto o tick) e a
+# finalização automática descartam o cache na hora; o tempo ao vivo é
+# sobreposto a partir de live_tempos, então nunca fica atrasado.
+CACHE_PROVA_TTL = 5.0
+_cache_prova = {}
+_cache_lock = threading.Lock()
+_cache_geracao = 0
+
+
+def ver_prova_cache(codigo, tipo):
+    chave = (codigo, tipo)
+    agora = time.time()
+    with _cache_lock:
+        geracao = _cache_geracao
+        c = _cache_prova.get(chave)
+        if c and agora - c[0] < CACHE_PROVA_TTL:
+            return c[1]
+    resultado = db.ver_prova(codigo, tipo)
+    with _cache_lock:
+        # só guarda se nada foi alterado enquanto a consulta rodava
+        if resultado is not None and geracao == _cache_geracao:
+            _cache_prova[chave] = (agora, resultado)
+    return resultado
+
+
+def invalidar_cache_prova():
+    global _cache_geracao
+    with _cache_lock:
+        _cache_geracao += 1
+        _cache_prova.clear()
+
+
+@app.after_request
+def _invalidar_cache_apos_alteracao(resp):
+    if (request.method != 'GET' and request.path.startswith('/api/')
+            and not request.path.endswith('/tick')):
+        invalidar_cache_prova()
+    return resp
+
+
 def registrar_tempo_live(item_id, texto, segundos):
     with live_lock:
         live_tempos[item_id] = {"t": texto, "s": segundos, "sujo": True, "em": time.time()}
@@ -158,7 +201,7 @@ def api_ver_prova(codigo, tipo):
     codigo = codigo.upper()
     if tipo not in ('eliminatorias', 'final'):
         return jsonify({"ok": False}), 404
-    resultado = db.ver_prova(codigo, tipo)
+    resultado = ver_prova_cache(codigo, tipo)
     if resultado is None:
         return jsonify({"ok": False}), 404
     prova = resultado['prova']
@@ -413,6 +456,7 @@ def _reaper():
         flush_tempos()
         try:
             for vencida in db.provas_para_finalizar_automaticamente():
+                invalidar_cache_prova()
                 marcar_prova_ativa_para(vencida['vinculados'], False)
                 for esp32_id in vencida['vinculados']:
                     empurrar_comandos(esp32_id, ["FINALIZAR"])
@@ -850,11 +894,15 @@ let relogioSyncSegundos = 0;
 let relogioSyncEm = 0;
 let relogioAtivo = false;
 
+let atualizandoProva = false, seqProva = 0;
 async function atualizarProva() {
   if (telaAtual !== 'eliminatorias' && telaAtual !== 'final') return;
+  const meuSeq = ++seqProva;
+  atualizandoProva = true;
   try {
-    const resp = await fetch(`/api/sala/${codigo}/prova/${tipoProvaAtual}`);
+    const resp = await fetch(`/api/sala/${codigo}/prova/${tipoProvaAtual}`, { cache: 'no-store' });
     const data = await resp.json();
+    if (meuSeq !== seqProva) return;   // chegou uma resposta mais nova antes: descarta esta
     if (!data.ok) { marcarOffline(true); return; }
     marcarOffline(false);
 
@@ -892,7 +940,9 @@ async function atualizarProva() {
       });
     }
   } catch (e) {
-    marcarOffline(true);
+    if (meuSeq === seqProva) marcarOffline(true);
+  } finally {
+    if (meuSeq === seqProva) atualizandoProva = false;
   }
 }
 
@@ -1066,8 +1116,8 @@ async function sincronizarFundo() {
 }
 
 setInterval(() => {
-  if (telaAtual === 'eliminatorias' || telaAtual === 'final') atualizarProva();
-}, 500);
+  if ((telaAtual === 'eliminatorias' || telaAtual === 'final') && !atualizandoProva) atualizarProva();
+}, 300);
 // interpolação local do relógio grande — atualiza a cada 100ms (com
 // milissegundos) sem precisar bater no servidor a essa frequência
 setInterval(() => {
